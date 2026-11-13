@@ -8,6 +8,7 @@ use crate::bvh::Bvh;
 use crate::light::Light;
 use crate::material::Material;
 use crate::math::*;
+use crate::medium::Fog;
 
 /// Surface interaction, the result of a ray hitting the scene.
 #[derive(Clone, Copy, Debug)]
@@ -52,6 +53,8 @@ pub struct SceneBuilder {
     tri_material: Vec<u32>,
     pub materials: Vec<Material>,
     pub lights: Vec<Light>,
+    /// Fog or haze filling a box of the scene, see `Fog`.
+    pub fog: Option<Fog>,
     portals: Vec<[Vec3; 3]>,
 }
 
@@ -242,6 +245,7 @@ impl SceneBuilder {
             bbox,
             has_transparency,
             has_cutouts,
+            fog: self.fog.filter(|f| !f.medium.is_empty()),
         };
 
         // every emissive triangle is an area light
@@ -400,6 +404,8 @@ pub struct Scene {
     /// Some material has holes, see `Material::has_cutouts`. Without them traversal never
     /// looks at materials.
     has_cutouts: bool,
+    /// Fog or haze filling a box of the scene.
+    pub fog: Option<Fog>,
 }
 
 /// Watertight ray-triangle intersection, ported from `Triangle::GetIntersect`.
@@ -548,10 +554,20 @@ impl Scene {
         self.bvh.occluded(ray, |tri| self.hit_triangle(tri, ray, ray.tmax).is_some())
     }
 
-    /// Fraction of light that travels along a shadow ray. Thin transmissive surfaces and
-    /// partially covering ones attenuate the light instead of blocking it
-    /// (`Visibility::GetAttenuation` with transparent shadows).
+    /// Fraction of light that travels along a shadow ray: what the surfaces in the way let
+    /// through (`surface_transmittance`), times what the fog does.
     pub fn transmittance(&self, ray: &Ray) -> Spectrum {
+        let attenuation = self.surface_transmittance(ray);
+        match &self.fog {
+            Some(fog) if !is_black(attenuation) => attenuation * fog.transmittance(ray),
+            _ => attenuation,
+        }
+    }
+
+    /// Fraction of light the surfaces along a shadow ray let through. Thin transmissive
+    /// surfaces and partially covering ones attenuate the light instead of blocking it
+    /// (`Visibility::GetAttenuation` with transparent shadows).
+    pub fn surface_transmittance(&self, ray: &Ray) -> Spectrum {
         if !self.has_transparency {
             return if self.is_occluded(ray) { Spectrum::ZERO } else { Spectrum::ONE };
         }
@@ -716,7 +732,10 @@ impl Scene {
 
         // start outside of the scene, something may shade the portal
         let back = 2.0 * self.world_radius + (q - self.bbox.center()).length();
-        let (hit, attenuation) = self.first_opaque_hit(&Ray::new(q - *dir * back, *dir, 0.0, f32::MAX))?;
+        let (hit, mut attenuation) = self.first_opaque_hit(&Ray::new(q - *dir * back, *dir, 0.0, f32::MAX))?;
+        if let Some(fog) = &self.fog {
+            attenuation *= fog.transmittance(&Ray::new(q - *dir * back, *dir, 0.0, hit.t));
+        }
         let density = self.sun_point_density(light, &hit);
         (density > 0.0).then(|| SunPoint { hit, dir: *dir, irradiance: *intensity * attenuation, density })
     }

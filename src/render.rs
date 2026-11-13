@@ -172,6 +172,7 @@ mod tests {
     use super::*;
     use crate::light::{Light, Sky};
     use crate::material::{AlphaMode, Cloth, Material, Texture};
+    use crate::medium::{Fog, HenyeyGreenstein, Medium};
     use crate::scene::SceneBuilder;
     use std::sync::Arc;
 
@@ -583,5 +584,98 @@ mod tests {
         let glazed = ao_center_pixel(&scene, 256, 3.0).x;
         // once through the pane for the camera, once for every occlusion ray
         assert!(glazed > 0.8 && glazed <= 1.0, "behind glass: {glazed}");
+    }
+
+    /// Fog that only scatters neither adds nor removes light: under a uniform sky of radiance
+    /// 1, with nothing else in sight, a box of it is invisible.
+    #[test]
+    fn scattering_fog_furnace() {
+        for g in [0.0, 0.7] {
+            let mut builder = SceneBuilder::new();
+            // the scene needs a triangle, out of the way
+            let black = builder.add_material(Material { base_color: Spectrum::ZERO, specular: 0.0, ..Default::default() });
+            builder.add_box(Vec3::splat(900.0), Vec3::splat(900.1), black);
+            builder.add_light(Light::Sky(Sky { intensity: Spectrum::ONE, env: None, rotation: 0.0 }));
+            builder.fog = Some(Fog {
+                medium: Medium::scattering(1.0, Spectrum::ONE, g),
+                min: Vec3::splat(-1.0),
+                max: Vec3::splat(1.0),
+            });
+            let result = center_pixel(&builder.build(), 4000, 64);
+            assert!((result - Spectrum::ONE).abs().max_element() < 0.02, "g={g}: {result:?}");
+        }
+    }
+
+    /// A layer of absorbing fog one meter thick over a glowing floor dims it by Beer's law,
+    /// and a tinted glass slab one meter thick by the color it is given at that distance.
+    #[test]
+    fn absorption_follows_the_distance_travelled() {
+        let glowing = Material { base_color: Spectrum::ZERO, specular: 0.0, emissive: Spectrum::ONE, ..Default::default() };
+
+        let sigma_a = Spectrum::new(0.5, 1.0, 2.0);
+        let mut builder = SceneBuilder::new();
+        let id = builder.add_material(glowing.clone());
+        floor(&mut builder, id);
+        let medium = Medium { sigma_a, sigma_s: Spectrum::ZERO, phase: HenyeyGreenstein::new(0.0) };
+        let inf = f32::INFINITY;
+        builder.fog = Some(Fog { medium, min: Vec3::new(-inf, 1.0, -inf), max: Vec3::new(inf, 2.0, inf) });
+        let result = center_pixel(&builder.build(), 64, 6);
+        let expected = sigma_a.map(|s| (-s).exp());
+        assert!((result - expected).abs().max_element() < 1e-3, "fog: {result:?} vs {expected:?}");
+
+        let color = Spectrum::new(0.9, 0.6, 0.3);
+        let through_slab = |medium: Option<Medium>| {
+            let mut builder = SceneBuilder::new();
+            let id = builder.add_material(glowing.clone());
+            floor(&mut builder, id);
+            let glass = builder.add_material(Material {
+                base_color: Spectrum::ONE,
+                transmission: 1.0,
+                roughness: 0.0,
+                medium,
+                ..Default::default()
+            });
+            builder.add_box(Vec3::new(-50.0, 1.0, -50.0), Vec3::new(50.0, 2.0, 50.0), glass);
+            center_pixel(&builder.build(), 2000, 12)
+        };
+        let clear = through_slab(None);
+        let tinted = through_slab(Some(Medium::absorbing(color, 1.0)));
+        assert!(clear.min_element() > 0.8, "clear slab: {clear:?}");
+        // light reflected back and forth inside the slab travels further, a small part of it
+        let ratio = tinted / clear;
+        assert!((ratio - color).abs().max_element() < 0.03, "slab: {ratio:?} vs {color:?}");
+    }
+
+    /// Fog lit by a sun, seen from the side: a path that scatters once and the light sampled
+    /// from that vertex must give what the integral of single scattering does.
+    #[test]
+    fn single_scattering_matches_the_integral() {
+        let (sigma, albedo, irradiance) = (0.4f32, 0.6f32, 5.0f32);
+        let mut builder = SceneBuilder::new();
+        let black = builder.add_material(Material { base_color: Spectrum::ZERO, specular: 0.0, ..Default::default() });
+        builder.add_box(Vec3::splat(900.0), Vec3::splat(900.1), black);
+        // the sun shines straight down on a layer between y = -1 and y = 1
+        builder.add_light(Light::Distant { dir: -Vec3::Y, intensity: Spectrum::splat(irradiance) });
+        let inf = f32::INFINITY;
+        builder.fog = Some(Fog {
+            medium: Medium::scattering(sigma, Spectrum::splat(albedo), 0.0),
+            min: Vec3::new(-inf, -1.0, -inf),
+            max: Vec3::new(inf, 1.0, inf),
+        });
+        let scene = builder.build();
+
+        // look straight up through the layer from below it, away from the sun's direction of
+        // travel: the camera ray and the sun ray share the vertical line
+        let camera = Camera::look_at(Vec3::new(0.0, -3.0, 0.0), Vec3::ZERO, Vec3::Z, 0.01, 3, 3);
+        // one bounce: single scattering only
+        let settings = RenderSettings { samples_per_pixel: 20000, max_depth: 1, ..Default::default() };
+        let result = render(&scene, &camera, &settings, |_| {})[4].x;
+
+        // A point at height y gets the sun through (1 - y) of fog and is seen through (y + 1)
+        // of it: the two always add up to the thickness of the layer.
+        let thickness = 2.0;
+        let phase = 1.0 / (4.0 * PI);
+        let expected = irradiance * sigma * albedo * phase * thickness * (-sigma * thickness).exp();
+        assert!((result - expected).abs() < 0.02 * expected, "{result} vs {expected}");
     }
 }

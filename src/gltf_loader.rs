@@ -9,6 +9,7 @@ use crate::camera::Camera;
 use crate::light::Light;
 use crate::material::{AlphaMode, Material, Texture, TextureMap};
 use crate::math::*;
+use crate::medium::Medium;
 use crate::scene::SceneBuilder;
 use glam::Affine2;
 use gltf::json::Value;
@@ -176,7 +177,7 @@ fn convert_material(material: &gltf::Material, textures: &mut TextureCache) -> M
     let sheen = material.extension_value("KHR_materials_sheen");
     let sheen_field = |key: &str| sheen.and_then(|s| s.get(key));
 
-    Material {
+    let mut converted = Material {
         name: material.name().unwrap_or("").to_string(),
         base_color: Vec3::new(base[0], base[1], base[2]),
         base_color_tex: pbr.base_color_texture().and_then(|t| textures.map(t, true)),
@@ -192,6 +193,13 @@ fn convert_material(material: &gltf::Material, textures: &mut TextureCache) -> M
         transmission,
         thin: transmission > 0.0 && thickness <= 0.0,
         ior: material.ior().unwrap_or(1.5),
+        // a solid absorbs light along the way, down to `attenuationColor` after
+        // `attenuationDistance`
+        medium: material
+            .volume()
+            .filter(|v| transmission > 0.0 && thickness > 0.0 && v.attenuation_distance().is_finite())
+            .map(|v| Medium::absorbing(Vec3::from(v.attenuation_color()), v.attenuation_distance()))
+            .filter(|m| !m.is_empty()),
         // the index of refraction of the clearcoat is 1.5 in glTF, the coat's default
         coat: number(clearcoat_field("clearcoatFactor"), 0.0),
         coat_tex: textures.map_json(clearcoat_field("clearcoatTexture"), false),
@@ -205,6 +213,57 @@ fn convert_material(material: &gltf::Material, textures: &mut TextureCache) -> M
         // a material whose name starts with "portal" marks an opening for sky light
         portal: material.name().is_some_and(|n| n.to_ascii_lowercase().starts_with("portal")),
         ..Default::default()
+    };
+    if let Some(sg) = material.pbr_specular_glossiness() {
+        specular_glossiness(&mut converted, &sg, textures);
+    }
+    converted
+}
+
+/// How metallic a specular color of the specular-glossiness workflow is. Dielectrics reflect
+/// a few percent, metals most of the light; in between is a ramp.
+fn metallic_of_specular(specular: Vec3) -> f32 {
+    ((specular.max_element() - 0.25) / 0.5).clamp(0.0, 1.0)
+}
+
+/// Approximate a `KHR_materials_pbrSpecularGlossiness` material with the metallic-roughness
+/// one: the diffuse color becomes the base color, roughness is `1 - glossiness` and bright
+/// speculars turn the surface metallic.
+fn specular_glossiness(
+    converted: &mut Material,
+    sg: &gltf::material::PbrSpecularGlossiness,
+    textures: &mut TextureCache,
+) {
+    let diffuse = sg.diffuse_factor();
+    let specular = Vec3::from(sg.specular_factor());
+    let glossiness = sg.glossiness_factor();
+    converted.base_color = Vec3::new(diffuse[0], diffuse[1], diffuse[2]);
+    converted.alpha = diffuse[3];
+    converted.base_color_tex = sg.diffuse_texture().and_then(|t| textures.map(t, true));
+    converted.metallic_roughness_tex = None;
+    converted.metallic = metallic_of_specular(specular);
+    converted.roughness = 1.0 - glossiness;
+    // a metal takes its color from the specular
+    if converted.base_color_tex.is_none() {
+        converted.base_color = converted.base_color.lerp(specular, converted.metallic);
+    }
+
+    // specular in the color channels (sRGB), glossiness in alpha: rewritten as the
+    // metallic-roughness texture, roughness in green and metallic in blue
+    if let Some(map) = sg.specular_glossiness_texture().and_then(|t| textures.map(t, true)) {
+        let source = &map.texture;
+        let data = (0..source.width * source.height)
+            .map(|i| {
+                let texel = source.texel(i % source.width, i / source.width);
+                let roughness = 1.0 - glossiness * texel.w;
+                let metallic = metallic_of_specular(specular * texel.truncate());
+                [0, (roughness * 255.0).round() as u8, (metallic * 255.0).round() as u8, 255]
+            })
+            .collect();
+        let texture = Texture { width: source.width, height: source.height, data, srgb: false };
+        converted.metallic_roughness_tex = Some(TextureMap { texture: Arc::new(texture), transform: map.transform });
+        converted.metallic = 1.0;
+        converted.roughness = 1.0;
     }
 }
 

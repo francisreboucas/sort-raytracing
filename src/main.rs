@@ -3,6 +3,7 @@
 use sort_rs::camera::{Camera, Projection};
 use sort_rs::light::{EnvMap, Light, Sky};
 use sort_rs::math::*;
+use sort_rs::medium::{Fog, Medium};
 use sort_rs::render::{render, save_image, Integrator, RenderSettings, ToneMap};
 use sort_rs::{demo, gltf_loader};
 use std::path::PathBuf;
@@ -32,6 +33,8 @@ OPTIONS:
         --ortho-height <m>    Height of the orthographic view in meters [the camera's if orthographic,
                               else the whole scene when framed, else what the perspective camera
                               sees at the distance of the scene's center]
+        --eye <x,y,z>         Place the camera here, in meters (y is up)
+        --target <x,y,z>      Point the camera at this position [the center of the scene with --eye]
         --fov <degrees>       Override the vertical field of view (perspective)
         --aperture <radius>   Lens radius for depth of field [0] (perspective)
         --focus <distance>    Focus distance for depth of field (perspective)
@@ -41,6 +44,12 @@ OPTIONS:
         --env-rotate <deg>    Rotate the environment map around the vertical axis [0]
         --sun <az,el>         Add a sun, azimuth and elevation in degrees
         --sun-intensity <f>   Irradiance of the sun [20]
+        --fog <density>       Fill the scene with fog or haze that removes this fraction of the
+                              light per meter: 0.01 is a light haze, 0.2 a dusty room
+        --fog-color <r,g,b>   Part of that light the fog scatters, the rest is absorbed [1,1,1]
+        --fog-anisotropy <g>  -1 to 1: 0 scatters evenly, towards 1 forward (haze is near 0.8) [0]
+        --fog-height <m>      Make the fog a layer below this height that goes on forever
+                              sideways, for exteriors [a box around the scene]
         --exposure <f>        Exposure multiplier [1]
         --tonemap <aces|none> Tone mapping for .png/.jpg output [aces, none with ao]
         --filter-glossy <f>   Blur of polished surfaces seen after a rough bounce, which turns
@@ -75,6 +84,12 @@ struct Args {
     env_intensity: f32,
     env_rotate: f32,
     sun: Option<(f32, f32)>,
+    fog: Option<f32>,
+    fog_color: Vec3,
+    fog_anisotropy: f32,
+    fog_height: Option<f32>,
+    eye: Option<Vec3>,
+    target: Option<Vec3>,
     sun_intensity: f32,
     exposure: f32,
     /// `None` when not given: it then depends on the integrator.
@@ -111,6 +126,12 @@ fn parse_args() -> Result<Option<Args>, String> {
         env_intensity: 1.0,
         env_rotate: 0.0,
         sun: None,
+        fog: None,
+        fog_color: Vec3::ONE,
+        fog_anisotropy: 0.0,
+        fog_height: None,
+        eye: None,
+        target: None,
         sun_intensity: 20.0,
         exposure: 1.0,
         tone_map: None,
@@ -144,6 +165,14 @@ fn parse_args() -> Result<Option<Args>, String> {
                 })
             }
             "--ortho-height" => args.ortho_height = Some(num(&arg, value()?)?),
+            "--eye" => {
+                let c = parse_list(&value()?, 3)?;
+                args.eye = Some(Vec3::new(c[0], c[1], c[2]));
+            }
+            "--target" => {
+                let c = parse_list(&value()?, 3)?;
+                args.target = Some(Vec3::new(c[0], c[1], c[2]));
+            }
             "--fov" => args.fov = Some(num(&arg, value()?)?),
             "--aperture" => args.aperture = num(&arg, value()?)?,
             "--focus" => args.focus = Some(num(&arg, value()?)?),
@@ -159,6 +188,13 @@ fn parse_args() -> Result<Option<Args>, String> {
                 args.sun = Some((c[0], c[1]));
             }
             "--sun-intensity" => args.sun_intensity = num(&arg, value()?)?,
+            "--fog" => args.fog = Some(num(&arg, value()?)?),
+            "--fog-color" => {
+                let c = parse_list(&value()?, 3)?;
+                args.fog_color = Vec3::new(c[0], c[1], c[2]);
+            }
+            "--fog-anisotropy" => args.fog_anisotropy = num(&arg, value()?)?,
+            "--fog-height" => args.fog_height = Some(num(&arg, value()?)?),
             "--exposure" => args.exposure = num(&arg, value()?)?,
             "--tonemap" => {
                 args.tone_map = Some(match value()?.as_str() {
@@ -192,6 +228,12 @@ fn parse_args() -> Result<Option<Args>, String> {
     }
     if args.ortho_height.is_some_and(|h| !(h > 0.0)) {
         return Err("the orthographic height must be positive".into());
+    }
+    if args.fog.is_some_and(|d| !(d >= 0.0)) {
+        return Err("the fog density must not be negative".into());
+    }
+    if !(args.fog_anisotropy > -1.0 && args.fog_anisotropy < 1.0) {
+        return Err("the fog anisotropy must be between -1 and 1".into());
     }
     if !(args.ao_distance > 0.0) {
         return Err("the ambient occlusion distance must be positive".into());
@@ -236,10 +278,33 @@ fn run(args: Args) -> Result<(), String> {
         builder.lights.retain(|l| !matches!(l, Light::Sky(_)));
         let env = match &args.env {
             Some(path) => {
-                let img = image::open(path).map_err(|e| format!("failed to load {}: {e}", path.display()))?.into_rgb32f();
+                let failed = |e: &dyn std::fmt::Display| format!("failed to load {}: {e}", path.display());
+                // large sky maps go over the default memory limit of the decoder
+                let mut reader = image::ImageReader::open(path).map_err(|e| failed(&e))?;
+                reader.no_limits();
+                let img = reader.with_guessed_format().map_err(|e| failed(&e))?.decode().map_err(|e| failed(&e))?;
+                let img = img.into_rgb32f();
                 let (w, h) = (img.width() as usize, img.height() as usize);
-                let pixels = img.pixels().map(|p| Vec3::new(p[0], p[1], p[2])).collect();
-                Some(EnvMap::new(w, h, pixels))
+                // Maps wider than MAX_ENV_WIDTH are averaged down by a whole factor, which keeps
+                // the energy of the sun and bounds the memory of the map and its sampling tables.
+                const MAX_ENV_WIDTH: usize = 8192;
+                let factor = w.div_ceil(MAX_ENV_WIDTH).max(1);
+                let (sw, sh) = ((w / factor).max(1), (h / factor).max(1));
+                let texel = |x: usize, y: usize| {
+                    let p = img.get_pixel(x.min(w - 1) as u32, y.min(h - 1) as u32);
+                    Vec3::new(p[0], p[1], p[2])
+                };
+                let pixels = (0..sw * sh)
+                    .map(|i| {
+                        let (x, y) = (i % sw * factor, i / sw * factor);
+                        let sum: Vec3 = (0..factor * factor).map(|k| texel(x + k % factor, y + k / factor)).sum();
+                        sum / (factor * factor) as f32
+                    })
+                    .collect();
+                if factor > 1 {
+                    eprintln!("environment map reduced from {w}x{h} to {sw}x{sh}");
+                }
+                Some(EnvMap::new(sw, sh, pixels))
             }
             None => None,
         };
@@ -254,6 +319,15 @@ fn run(args: Args) -> Result<(), String> {
         let (az, el) = (azimuth.to_radians(), elevation.to_radians());
         let to_sun = Vec3::new(el.cos() * az.cos(), el.sin(), el.cos() * az.sin());
         builder.add_light(Light::Distant { dir: -to_sun, intensity: Vec3::splat(args.sun_intensity) });
+    }
+    if let Some(density) = args.fog {
+        let bounds = builder.bounds();
+        let (min, max) = match args.fog_height {
+            Some(height) => (Vec3::NEG_INFINITY, Vec3::new(f32::INFINITY, height, f32::INFINITY)),
+            None => (bounds.min, bounds.max),
+        };
+        let medium = Medium::scattering(density, args.fog_color, args.fog_anisotropy);
+        builder.fog = Some(Fog { medium, min, max });
     }
     let has_emitters = builder.materials.iter().any(|m| m.is_emissive());
     if builder.lights.is_empty() && !has_emitters {
@@ -276,6 +350,7 @@ fn run(args: Args) -> Result<(), String> {
         scene.lights.len(),
         start.elapsed()
     );
+    eprintln!("bounds: {:.2} to {:.2}", scene.bbox.min, scene.bbox.max);
 
     // radius of the bounding sphere when the camera frames the whole scene
     let mut framed_radius = None;
@@ -290,6 +365,17 @@ fn run(args: Args) -> Result<(), String> {
             Camera::look_at(eye, center, Vec3::Y, 40f32.to_radians(), args.width, height)
         }
     };
+    if args.eye.is_some() || args.target.is_some() {
+        let eye = args.eye.unwrap_or(camera.eye);
+        let target = args.target.unwrap_or(scene.bbox.center());
+        if (target - eye).length_squared() < 1e-12 {
+            return Err("--eye and --target must be different positions".into());
+        }
+        let projection = camera.projection;
+        camera = Camera::look_at(eye, target, Vec3::Y, camera.fov_y, camera.width, camera.height);
+        camera.projection = projection;
+        framed_radius = None;
+    }
     if let Some(fov) = args.fov {
         camera.fov_y = fov.to_radians();
     }

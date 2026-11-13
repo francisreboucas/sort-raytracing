@@ -24,6 +24,7 @@ gltf = { version = "1.4", features = [
     "KHR_materials_ior",
     "KHR_materials_emissive_strength",
     "KHR_texture_transform",
+    "KHR_materials_pbrSpecularGlossiness",
     # raw JSON of the extensions the crate has no types for (clearcoat, sheen)
     "extensions",
 ] }

@@ -34,17 +34,23 @@ cargo run --release -- --demo -o demo.png                 # o interior embutido
 cargo run --release -- casa.glb -o casa.png -w 1920 --spp 512 --depth 8
 cargo run --release -- casa.glb --env ceu.hdr --env-rotate 90       # iluminada por um ambiente HDR
 cargo run --release -- casa.glb --sun 135,40 --sky 1.2,1.6,2.2      # um sol (azimute, elevação) e um céu liso
+cargo run --release -- casa.glb --eye 14,1.7,26 --target 0,4.5,0      # posiciona a câmera, em metros
 cargo run --release -- casa.glb -o casa.exr               # radiância linear
 cargo run --release -- casa.glb --projection ortho --ortho-height 8    # vista ortográfica de 8 m de altura
 cargo run --release -- casa.glb --projection panorama -w 4096          # panorama de 360 graus, 4096x2048
 cargo run --release -- casa.glb --integrator ao --ao-distance 2        # render branco de maquete, ambient occlusion
+cargo run --release -- casa.glb --fog 0.06 --fog-anisotropy 0.6        # poeira no ar de uma sala
+cargo run --release -- casa.glb --fog 0.008 --fog-height 30            # uma camada de névoa sobre um terreno
 cargo run --release -- --help
 ```
 
 As cenas são glTF 2.0 (`.gltf` ou `.glb`): malhas, materiais metallic-roughness com suas
 texturas, modos de alpha (mask e blend), `KHR_texture_transform`, clearcoat
 (`KHR_materials_clearcoat`) e sheen (`KHR_materials_sheen`), câmeras e as luzes de
-`KHR_lights_punctual`. Comprimentos em metros, Y para cima. Um arquivo que lista clearcoat ou
+`KHR_lights_punctual`. Materiais do fluxo antigo specular-glossiness
+(`KHR_materials_pbrSpecularGlossiness`) são convertidos de forma aproximada. Comprimentos em
+metros, Y para cima. Mapas de ambiente com mais de 8192 pixels de largura são reduzidos pela
+média ao carregar. Um arquivo que lista clearcoat ou
 sheen em `extensionsRequired` (e não só em `extensionsUsed`) é recusado pelo crate `gltf`, que só
 aceita as extensões obrigatórias para as quais tem tipos.
 Imagens `.png` e `.jpg` recebem tone mapping (ACES por padrão) e sRGB; `.exr` e `.hdr` guardam
@@ -146,6 +152,7 @@ referência) e `variance` (variância de cada pixel, um tipo de luz por vez).
 | `bsdf/coat` | `bsdf.rs`, `material.rs` | Uma camada de verniz ou laca; a base sob ela é o Disney BRDF. `Material::coat`, clearcoat do glTF |
 | `bsdf/fabric`, `distributionbrdf` | `bsdf.rs`, `material.rs` | O tecido da DreamWorks e o tecido baseado em distribuição de The Order: 1886, como `Material::cloth`; o segundo também é o sheen do glTF |
 | `bsdf/doublesided` | `scene.rs`, `material.rs` | Um material de trás, `Material::back_material`, sombreia a face de trás |
+| `medium/absorption`, `homogeneous`, `phasefunction` | `medium.rs`, `integrator.rs` | Neblina e névoa em uma caixa ou camada (`--fog`) e o interior de vidro maciço ou água (`Material::medium`, atenuação do `KHR_materials_volume` do glTF); função de fase de Henyey-Greenstein |
 | `scatteringevent` | `bsdf.rs` | Uma mistura de BXDFs com pesos de avaliação e de amostragem |
 | `light/distant`, `pointlight`, `spot`, `skylight`, `hdrskylight`, `area` | `light.rs` | Uma luz de área é um conjunto de triângulos emissivos |
 | `material` e a Tiny Shading Language | `material.rs` | Sem linguagem de shading: um conjunto fixo de parâmetros vira as closures |
@@ -173,9 +180,17 @@ referência) e `variance` (variância de cada pixel, um tipo de luz por vez).
   tecido é normalizado com o albedo exato do seu lobo; a tabela do SORT o deixa de 7 a 21% mais
   escuro.
 
+- **Meios participantes.** O SORT prende um meio a qualquer malha e mantém uma pilha dos meios
+  em que o raio está. Aqui um meio é neblina preenchendo uma caixa (os limites da cena, ou uma
+  camada abaixo de uma altura que se estende sem fim para os lados) ou o interior de um objeto
+  transmissivo maciço. Uma caixa dispensa malha de contorno e funciona onde quer que a câmera
+  esteja. A absorção não é amostrada, é um fator simples; os vértices de um caminho dentro de
+  um meio são iluminados como os das superfícies, com a mesma amostragem de luz.
+
 ## Ainda não portado
 
-Meios participantes, sub-surface scattering, cabelo e pelo, os BRDFs MERL e Fourier, os outros
+O meio heterogêneo (precisa de dados de volume), meios presos a malhas quaisquer, emissão
+dentro de um meio, sub-surface scattering, cabelo e pelo, os BRDFs MERL e Fourier, os outros
 integradores (bidirecional, light tracing, instant radiosity, Whitted), os outros aceleradores
 (QBVH, OBVH, k-d tree, octree, grade uniforme) e SIMD. Um coat sobre outra coisa que não o
 Disney BRDF. Do lado do glTF: conjuntos de coordenadas de textura além de `TEXCOORD_0`, o normal
@@ -184,9 +199,9 @@ ali, então um normal map transformado é aplicado com as UVs da malha como est�
 
 ## Testes
 
-`cargo test` roda 41 testes: amostragem por importância contra valor e pdf de cada BXDF, a BVH
+`cargo test` roda 48 testes: amostragem por importância contra valor e pdf de cada BXDF, a BVH
 contra um laço de força bruta, a câmera, o mapa de ambiente, o loader de glTF, materiais e suas
-texturas e renders comparados com resultados analíticos.
+texturas, meios participantes e renders comparados com resultados analíticos.
 
 ## Modelos
 
