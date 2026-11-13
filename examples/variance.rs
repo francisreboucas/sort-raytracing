@@ -2,11 +2,11 @@
 //! kind of light at a time. `variance [depth] [filter-glossy]`
 
 use rayon::prelude::*;
-use sort_rs::demo;
-use sort_rs::integrator::PathTracing;
-use sort_rs::light::Light;
-use sort_rs::math::*;
-use sort_rs::rng::Rng;
+use sort_raytracing::demo;
+use sort_raytracing::integrator::PathTracing;
+use sort_raytracing::light::Light;
+use sort_raytracing::math::*;
+use sort_raytracing::rng::Rng;
 
 fn main() {
     let depth: u32 = std::env::args().nth(1).and_then(|a| a.parse().ok()).unwrap_or(1);

@@ -6,12 +6,12 @@
 //!
 //! `cargo run --release --example materials -- [output.png] [samples per pixel]`
 
-use sort_rs::camera::Camera;
-use sort_rs::light::{Light, Sky};
-use sort_rs::material::{Cloth, Material};
-use sort_rs::math::{Vec2, Vec3};
-use sort_rs::render::{render, save_image, RenderSettings, ToneMap};
-use sort_rs::scene::SceneBuilder;
+use sort_raytracing::camera::Camera;
+use sort_raytracing::light::{Light, Sky};
+use sort_raytracing::material::{Cloth, Material};
+use sort_raytracing::math::{Vec2, Vec3};
+use sort_raytracing::render::{render, save_image, RenderSettings, ToneMap};
+use sort_raytracing::scene::SceneBuilder;
 use std::path::Path;
 
 /// A UV sphere: U goes around the vertical axis, which is the direction of the threads of

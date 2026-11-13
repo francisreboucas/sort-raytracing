@@ -6,12 +6,12 @@
 //! `height` is how tall the model is in meters (1.7 by default), which sets the scale. `side`
 //! is where the camera stands, `+x` (the default) or `-x`: the side the model's front is on.
 
-use sort_rs::camera::Camera;
-use sort_rs::gltf_loader;
-use sort_rs::light::{Light, Sky};
-use sort_rs::material::Material;
-use sort_rs::math::Vec3;
-use sort_rs::render::{render, save_image, RenderSettings, ToneMap};
+use sort_raytracing::camera::Camera;
+use sort_raytracing::gltf_loader;
+use sort_raytracing::light::{Light, Sky};
+use sort_raytracing::material::Material;
+use sort_raytracing::math::Vec3;
+use sort_raytracing::render::{render, save_image, RenderSettings, ToneMap};
 use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

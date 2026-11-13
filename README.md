@@ -9,14 +9,14 @@ the lighting reworked for interiors.
 
 [Português (Brasil)](README.pt-BR.md)
 
-![A sideboard, a chair, a plant and a floor lamp in a room lit by the sun through a window](assets/readme/furnished.png)
+![A sideboard, a chair, a plant and a floor lamp in a room lit by the sun through a window](https://raw.githubusercontent.com/francisreboucas/sort-raytracing/main/assets/readme/furnished.png)
 
 A glTF model placed in a room with a glazed window, lit by the sun and the sky; 300 samples per
 pixel. Furniture by Korusss ([credits](#models)).
 
 | | |
 |---|---|
-| ![A sofa in front of a bookcase with lit shelves](assets/readme/living-room.png) | ![A potted monstera casting the shadow of its leaves on a wall](assets/readme/monstera.png) |
+| ![A sofa in front of a bookcase with lit shelves](https://raw.githubusercontent.com/francisreboucas/sort-raytracing/main/assets/readme/living-room.png) | ![A potted monstera casting the shadow of its leaves on a wall](https://raw.githubusercontent.com/francisreboucas/sort-raytracing/main/assets/readme/monstera.png) |
 | Sofa and bookcase by uniboxtrade: 124 thousand triangles, the strips of light in the shelves are emissive surfaces | Monstera by Giora |
 
 ## Status
@@ -55,7 +55,7 @@ only accepts the required extensions it has types for.
 `.png` and `.jpg` images are tone mapped (ACES by default) and sRGB encoded; `.exr` and `.hdr`
 hold linear radiance.
 
-![A room with a table, lit by the sun and the sky through a glazed window](assets/readme/interior.png)
+![A room with a table, lit by the sun and the sky through a glazed window](https://raw.githubusercontent.com/francisreboucas/sort-raytracing/main/assets/readme/interior.png)
 
 The built-in interior, `--demo`, at 320 samples per pixel.
 
@@ -82,7 +82,7 @@ let pixels = render(&scene, &camera, &RenderSettings::default(), |_fraction_done
 save_image(Path::new("room.png"), &pixels, camera.width, camera.height, 1.0, ToneMap::Aces)?;
 ```
 
-![A room lit through a doorway](assets/readme/library.png)
+![A room lit through a doorway](https://raw.githubusercontent.com/francisreboucas/sort-raytracing/main/assets/readme/library.png)
 
 `cargo run --release --example library` renders this image.
 
@@ -127,7 +127,7 @@ SORT where that makes noise:
 
 | `--filter-glossy 0`: exact caustics | default |
 |---|---|
-| ![Bright isolated pixels all over the walls](assets/readme/caustics-exact.png) | ![The same image with no isolated bright pixels](assets/readme/caustics-filtered.png) |
+| ![Bright isolated pixels all over the walls](https://raw.githubusercontent.com/francisreboucas/sort-raytracing/main/assets/readme/caustics-exact.png) | ![The same image with no isolated bright pixels](https://raw.githubusercontent.com/francisreboucas/sort-raytracing/main/assets/readme/caustics-filtered.png) |
 
 Both at 48 samples per pixel. Portals and sun points only change how light is sampled, not the
 result, which a test checks.
@@ -203,7 +203,7 @@ their textures, participating media, and renders compared with analytic results.
 
 ## Models
 
-The models in the images are in [`assets/models`](assets/models). They are not part of SORT-RayTracing
+The models in the images are in [`assets/models`](https://github.com/francisreboucas/sort-raytracing/tree/main/assets/models). They are not part of SORT-RayTracing
 and keep their own licenses:
 
 | Model | Author | License | File |

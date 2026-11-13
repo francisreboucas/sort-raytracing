@@ -1,11 +1,11 @@
 // This file is a part of SORT-rs, a Rust port of SORT (Simple Open Ray Tracing).
 
-use sort_rs::camera::{Camera, Projection};
-use sort_rs::light::{EnvMap, Light, Sky};
-use sort_rs::math::*;
-use sort_rs::medium::{Fog, Medium};
-use sort_rs::render::{render, save_image, Integrator, RenderSettings, ToneMap};
-use sort_rs::{demo, gltf_loader};
+use sort_raytracing::camera::{Camera, Projection};
+use sort_raytracing::light::{EnvMap, Light, Sky};
+use sort_raytracing::math::*;
+use sort_raytracing::medium::{Fog, Medium};
+use sort_raytracing::render::{render, save_image, Integrator, RenderSettings, ToneMap};
+use sort_raytracing::{demo, gltf_loader};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU32, Ordering};
