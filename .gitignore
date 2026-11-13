@@ -1,0 +1,6 @@
+target/
+out/
+*.png
+*.exr
+*.hdr
+!assets/**

@@ -1,0 +1,35 @@
+[package]
+name = "sort-rs"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "Pure Rust port of SORT (Simple Open-source Ray Tracing), focused on architectural rendering"
+
+[lib]
+name = "sort_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sort"
+path = "src/main.rs"
+
+[dependencies]
+glam = "0.34"
+rayon = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "hdr", "exr"] }
+gltf = { version = "1.4", features = [
+    "KHR_lights_punctual",
+    "KHR_materials_transmission",
+    "KHR_materials_volume",
+    "KHR_materials_ior",
+    "KHR_materials_emissive_strength",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+# Keep the statistical tests fast.
+[profile.dev]
+opt-level = 2
