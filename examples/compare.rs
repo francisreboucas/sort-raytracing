@@ -1,8 +1,8 @@
 //! Compare a render against a reference image: `compare <reference> <image>`.
 //! Prints the mean luminance of both and the relative mean squared error.
 
-use sort_rs::math::intensity;
-use sort_rs::math::Vec3;
+use sort_raytracing::math::intensity;
+use sort_raytracing::math::Vec3;
 
 fn load(path: &str) -> (u32, u32, Vec<Vec3>) {
     let img = image::open(path).unwrap_or_else(|e| panic!("failed to open {path}: {e}")).into_rgb32f();

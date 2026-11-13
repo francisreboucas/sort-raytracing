@@ -1,12 +1,18 @@
 [package]
-name = "sort-rs"
+name = "sort-raytracing"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-only"
 description = "Pure Rust port of SORT (Simple Open-source Ray Tracing), focused on architectural rendering"
+repository = "https://github.com/francisreboucas/sort-raytracing"
+readme = "README.md"
+keywords = ["raytracing", "path-tracing", "rendering", "gltf", "graphics"]
+categories = ["rendering", "graphics"]
+# The models and the README renders stay in the repository only: crates.io caps a crate at 10 MB.
+exclude = ["assets/", ".gitattributes"]
 
 [lib]
-name = "sort_rs"
+name = "sort_raytracing"
 path = "src/lib.rs"
 
 [[bin]]

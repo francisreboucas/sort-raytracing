@@ -62,5 +62,5 @@ The first release.
   glTF cameras have no focal distance. The height now comes from the distance to the center of
   the scene.
 
-[Unreleased]: https://github.com/francisreboucas/sort-rs/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/francisreboucas/sort-rs/releases/tag/v0.1.0
+[Unreleased]: https://github.com/francisreboucas/sort-raytracing/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/francisreboucas/sort-raytracing/releases/tag/v0.1.0
