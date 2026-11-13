@@ -1,4 +1,4 @@
-# SORT-rs
+# SORT-RayTracing
 
 [![Licença: GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-pure_Rust-orange.svg?logo=rust)](https://www.rust-lang.org/)
@@ -216,6 +216,6 @@ SORT-rs e mantêm suas próprias licenças:
 
 ## Licença
 
-O SORT-rs é uma obra derivada do SORT, que é Copyright (c) 2011-2023 Jiayin Cao e distribuído
+O SORT-RayTracing é uma obra derivada do SORT, que é Copyright (c) 2011-2023 Jiayin Cao e distribuído
 sob a GNU General Public License versão 3. O SORT-rs é distribuído sob a mesma licença,
 [GPL-3.0-only](LICENSE).
