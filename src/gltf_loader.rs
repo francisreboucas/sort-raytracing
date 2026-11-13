@@ -7,9 +7,11 @@
 
 use crate::camera::Camera;
 use crate::light::Light;
-use crate::material::{Material, Texture};
+use crate::material::{AlphaMode, Material, Texture, TextureMap};
 use crate::math::*;
 use crate::scene::SceneBuilder;
+use glam::Affine2;
+use gltf::json::Value;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -20,14 +22,21 @@ pub struct CameraDesc {
     pub eye: Vec3,
     pub forward: Vec3,
     pub up: Vec3,
-    /// Vertical field of view in radians.
+    /// Vertical field of view in radians (a default for an orthographic camera).
     pub fov_y: f32,
     pub aspect_ratio: Option<f32>,
+    /// Height of the view volume of an orthographic camera (glTF `ymag` is half of it),
+    /// `None` for a perspective one.
+    pub ortho_height: Option<f32>,
 }
 
 impl CameraDesc {
     pub fn to_camera(&self, width: u32, height: u32) -> Camera {
-        Camera::look_at(self.eye, self.eye + self.forward, self.up, self.fov_y, width, height)
+        let target = self.eye + self.forward;
+        match self.ortho_height {
+            Some(view_height) => Camera::orthographic(self.eye, target, self.up, view_height, width, height),
+            None => Camera::look_at(self.eye, target, self.up, self.fov_y, width, height),
+        }
     }
 }
 
@@ -37,11 +46,51 @@ pub struct Loaded {
 }
 
 struct TextureCache<'a> {
+    document: &'a gltf::Document,
     images: &'a [gltf::image::Data],
     cache: HashMap<(usize, bool), Option<Arc<Texture>>>,
+    /// Some texture asked for a texture coordinate set other than `TEXCOORD_0`, the only one
+    /// loaded.
+    other_uv_sets: bool,
 }
 
 impl TextureCache<'_> {
+    /// The texture of a texture info with its `KHR_texture_transform`, if any.
+    fn map(&mut self, info: gltf::texture::Info, srgb: bool) -> Option<TextureMap> {
+        let transform = info.texture_transform();
+        let tex_coord = transform.as_ref().and_then(|t| t.tex_coord()).unwrap_or(info.tex_coord());
+        self.other_uv_sets |= tex_coord != 0;
+        let transform = transform
+            .map(|t| {
+                TextureMap::khr_texture_transform(Vec2::from(t.offset()), t.rotation(), Vec2::from(t.scale()))
+            })
+            .filter(|t| *t != Affine2::IDENTITY);
+        Some(TextureMap { texture: self.get(info.texture(), srgb)?, transform })
+    }
+
+    /// `map` for a texture info read from the raw JSON of an extension.
+    fn map_json(&mut self, info: Option<&Value>, srgb: bool) -> Option<TextureMap> {
+        let info = info?;
+        let texture = self.document.textures().nth(info.get("index")?.as_u64()? as usize)?;
+        let transform = info.get("extensions").and_then(|e| e.get("KHR_texture_transform"));
+        let tex_coord = transform.and_then(|t| t.get("texCoord")).or(info.get("texCoord"));
+        self.other_uv_sets |= tex_coord.and_then(Value::as_u64).unwrap_or(0) != 0;
+        let transform = transform
+            .map(|t| {
+                let pair = |key: &str, default: Vec2| match t.get(key).and_then(Value::as_array).map(|a| a.as_slice()) {
+                    Some([x, y]) => Vec2::new(number(Some(x), default.x), number(Some(y), default.y)),
+                    _ => default,
+                };
+                TextureMap::khr_texture_transform(
+                    pair("offset", Vec2::ZERO),
+                    number(t.get("rotation"), 0.0),
+                    pair("scale", Vec2::ONE),
+                )
+            })
+            .filter(|t| *t != Affine2::IDENTITY);
+        Some(TextureMap { texture: self.get(texture, srgb)?, transform })
+    }
+
     fn get(&mut self, texture: gltf::Texture, srgb: bool) -> Option<Arc<Texture>> {
         let index = texture.source().index();
         let images = self.images;
@@ -89,6 +138,19 @@ fn convert_image(image: &gltf::image::Data, srgb: bool) -> Option<Texture> {
     Some(Texture { width, height, data, srgb })
 }
 
+/// A number of an extension's JSON, `default` when it is missing.
+fn number(value: Option<&Value>, default: f32) -> f32 {
+    value.and_then(Value::as_f64).map_or(default, |v| v as f32)
+}
+
+/// A color of an extension's JSON, `default` when it is missing.
+fn color(value: Option<&Value>, default: Spectrum) -> Spectrum {
+    match value.and_then(Value::as_array).map(|a| a.as_slice()) {
+        Some([r, g, b]) => Spectrum::new(number(Some(r), default.x), number(Some(g), default.y), number(Some(b), default.z)),
+        _ => default,
+    }
+}
+
 fn convert_material(material: &gltf::Material, textures: &mut TextureCache) -> Material {
     let pbr = material.pbr_metallic_roughness();
     let base = pbr.base_color_factor();
@@ -96,21 +158,49 @@ fn convert_material(material: &gltf::Material, textures: &mut TextureCache) -> M
     let transmission = material.transmission().map_or(0.0, |t| t.transmission_factor());
     // Per the glTF specification a transmissive material without a volume is thin-walled.
     let thickness = material.volume().map_or(0.0, |v| v.thickness_factor());
+    let alpha_mode = match material.alpha_mode() {
+        gltf::material::AlphaMode::Opaque => AlphaMode::Opaque,
+        gltf::material::AlphaMode::Mask => AlphaMode::Mask { cutoff: material.alpha_cutoff().unwrap_or(0.5) },
+        gltf::material::AlphaMode::Blend => AlphaMode::Blend,
+    };
+    // this version of the gltf crate does not expose KHR_texture_transform on normal textures
+    let normal_tex = material.normal_texture().and_then(|t| {
+        textures.other_uv_sets |= t.tex_coord() != 0;
+        textures.get(t.texture(), false).map(TextureMap::from)
+    });
+
+    // The crate has no types for these two, their JSON is read as it is. The clearcoat normal
+    // texture is not used.
+    let clearcoat = material.extension_value("KHR_materials_clearcoat");
+    let clearcoat_field = |key: &str| clearcoat.and_then(|c| c.get(key));
+    let sheen = material.extension_value("KHR_materials_sheen");
+    let sheen_field = |key: &str| sheen.and_then(|s| s.get(key));
 
     Material {
         name: material.name().unwrap_or("").to_string(),
         base_color: Vec3::new(base[0], base[1], base[2]),
-        base_color_tex: pbr.base_color_texture().and_then(|t| textures.get(t.texture(), true)),
+        base_color_tex: pbr.base_color_texture().and_then(|t| textures.map(t, true)),
+        alpha: base[3],
+        alpha_mode,
         metallic: pbr.metallic_factor(),
         roughness: pbr.roughness_factor(),
-        metallic_roughness_tex: pbr.metallic_roughness_texture().and_then(|t| textures.get(t.texture(), false)),
-        normal_tex: material.normal_texture().and_then(|t| textures.get(t.texture(), false)),
+        metallic_roughness_tex: pbr.metallic_roughness_texture().and_then(|t| textures.map(t, false)),
+        normal_tex,
         normal_scale: material.normal_texture().map_or(1.0, |t| t.scale()),
         emissive: Vec3::from(material.emissive_factor()) * emissive_strength,
-        emissive_tex: material.emissive_texture().and_then(|t| textures.get(t.texture(), true)),
+        emissive_tex: material.emissive_texture().and_then(|t| textures.map(t, true)),
         transmission,
         thin: transmission > 0.0 && thickness <= 0.0,
         ior: material.ior().unwrap_or(1.5),
+        // the index of refraction of the clearcoat is 1.5 in glTF, the coat's default
+        coat: number(clearcoat_field("clearcoatFactor"), 0.0),
+        coat_tex: textures.map_json(clearcoat_field("clearcoatTexture"), false),
+        coat_roughness: number(clearcoat_field("clearcoatRoughnessFactor"), 0.0),
+        coat_roughness_tex: textures.map_json(clearcoat_field("clearcoatRoughnessTexture"), false),
+        sheen_color: color(sheen_field("sheenColorFactor"), Spectrum::ZERO),
+        sheen_color_tex: textures.map_json(sheen_field("sheenColorTexture"), true),
+        sheen_roughness: number(sheen_field("sheenRoughnessFactor"), 0.0),
+        sheen_roughness_tex: textures.map_json(sheen_field("sheenRoughnessTexture"), false),
         double_sided: material.double_sided(),
         // a material whose name starts with "portal" marks an opening for sky light
         portal: material.name().is_some_and(|n| n.to_ascii_lowercase().starts_with("portal")),
@@ -138,15 +228,23 @@ impl Importer<'_> {
         }
 
         if let Some(camera) = node.camera() {
-            if let gltf::camera::Projection::Perspective(p) = camera.projection() {
-                self.cameras.push(CameraDesc {
-                    eye: world.transform_point3(Vec3::ZERO),
-                    forward: world.transform_vector3(-Vec3::Z).normalize_or_zero(),
-                    up: world.transform_vector3(Vec3::Y).normalize_or_zero(),
-                    fov_y: p.yfov(),
-                    aspect_ratio: p.aspect_ratio(),
-                });
-            }
+            use gltf::camera::Projection;
+            let (fov_y, aspect_ratio, ortho_height) = match camera.projection() {
+                Projection::Perspective(p) => (p.yfov(), p.aspect_ratio(), None),
+                Projection::Orthographic(o) => {
+                    let aspect = (o.ymag() != 0.0).then(|| (o.xmag() / o.ymag()).abs());
+                    // the field of view only matters if the projection is switched to perspective
+                    (40f32.to_radians(), aspect, Some(2.0 * o.ymag().abs()))
+                }
+            };
+            self.cameras.push(CameraDesc {
+                eye: world.transform_point3(Vec3::ZERO),
+                forward: world.transform_vector3(-Vec3::Z).normalize_or_zero(),
+                up: world.transform_vector3(Vec3::Y).normalize_or_zero(),
+                fov_y,
+                aspect_ratio,
+                ortho_height,
+            });
         }
 
         if let Some(light) = node.light() {
@@ -219,9 +317,17 @@ pub fn load(path: &Path) -> Result<Loaded, gltf::Error> {
     let (document, buffers, images) = gltf::import(path)?;
 
     let mut builder = SceneBuilder::new();
-    let mut textures = TextureCache { images: &images, cache: HashMap::new() };
+    let mut textures =
+        TextureCache { document: &document, images: &images, cache: HashMap::new(), other_uv_sets: false };
     for material in document.materials() {
         builder.add_material(convert_material(&material, &mut textures));
+    }
+    if textures.other_uv_sets {
+        eprintln!(
+            "warning: {}: some textures use a texture coordinate set other than TEXCOORD_0, \
+             which is the only one loaded; they are mapped with TEXCOORD_0",
+            path.display()
+        );
     }
 
     let mut importer =
@@ -347,5 +453,121 @@ mod tests {
         // a shadow ray crosses the thin glass attenuated, not blocked
         let through = scene.transmittance(&Ray::new(Vec3::new(0.0, 5.0, 0.0), -Vec3::Y, 0.0, 10.0));
         assert!(through.y > 0.9 && through.y < 1.0, "{through:?}");
+    }
+
+    /// Alpha modes and a texture transform on the base color texture.
+    #[test]
+    fn loads_alpha_modes_and_texture_transforms() {
+        // a 2x2 image, blue in the lower left quadrant (v points down)
+        let dir = std::env::temp_dir();
+        let stem = format!("sort_rs_alpha_test_{}", std::process::id());
+        let png = dir.join(format!("{stem}.png"));
+        let pixels = [[255u8, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [255, 255, 255, 0]];
+        image::RgbaImage::from_fn(2, 2, |x, y| image::Rgba(pixels[(y * 2 + x) as usize])).save(&png).unwrap();
+
+        let json = format!(
+            r#"{{
+  "asset": {{ "version": "2.0" }},
+  "extensionsUsed": ["KHR_texture_transform"],
+  "images": [{{ "uri": "{stem}.png" }}],
+  "textures": [{{ "source": 0 }}],
+  "materials": [
+    {{ "name": "leaf", "alphaMode": "MASK", "alphaCutoff": 0.3,
+       "pbrMetallicRoughness": {{ "baseColorTexture": {{ "index": 0 }} }} }},
+    {{ "name": "curtain", "alphaMode": "BLEND",
+       "pbrMetallicRoughness": {{ "baseColorFactor": [1.0, 1.0, 1.0, 0.4] }} }},
+    {{ "name": "tiles", "pbrMetallicRoughness": {{ "baseColorTexture": {{ "index": 0,
+       "extensions": {{ "KHR_texture_transform": {{ "offset": [0, 1], "rotation": 1.57079632679, "scale": [0.5, 0.5] }} }} }} }} }},
+    {{ "name": "other set", "pbrMetallicRoughness": {{ "baseColorTexture": {{ "index": 0, "texCoord": 1 }} }} }}
+  ]
+}}"#
+        );
+        let path = dir.join(format!("{stem}.gltf"));
+        std::fs::write(&path, json).unwrap();
+        let loaded = load(&path);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&png).ok();
+        let materials = loaded.expect("the file must load").builder.materials;
+
+        let [leaf, curtain, tiles, other] = &materials[..] else {
+            panic!("expected four materials");
+        };
+        assert_eq!(leaf.alpha_mode, AlphaMode::Mask { cutoff: 0.3 });
+        assert!(leaf.has_cutouts());
+        // the alpha of the texture: a hole in the lower right texel only
+        assert_eq!(leaf.opacity_at(Vec2::new(0.25, 0.25)), 1.0);
+        assert_eq!(leaf.opacity_at(Vec2::new(0.75, 0.75)), 0.0);
+
+        assert_eq!((curtain.alpha_mode, curtain.alpha), (AlphaMode::Blend, 0.4));
+        assert!((curtain.shadow_transmittance(Vec2::ZERO).unwrap() - Spectrum::splat(0.6)).abs().max_element() < 1e-6);
+
+        assert_eq!(tiles.alpha_mode, AlphaMode::Opaque);
+        let map = tiles.base_color_tex.as_ref().unwrap();
+        assert!(map.transform.is_some());
+        // the middle of the mesh UVs is the middle of the lower left quadrant
+        assert!((tiles.base_color_at(Vec2::splat(0.5)) - Vec3::new(0.0, 0.0, 1.0)).abs().max_element() < 1e-5);
+        assert!(other.base_color_tex.as_ref().unwrap().transform.is_none());
+    }
+
+    /// `KHR_materials_clearcoat` and `KHR_materials_sheen`, read from the raw JSON.
+    #[test]
+    fn loads_clearcoat_and_sheen() {
+        let dir = std::env::temp_dir();
+        let stem = format!("sort_rs_coat_test_{}", std::process::id());
+        let png = dir.join(format!("{stem}.png"));
+        // half red on the left, a quarter on the right; alpha 1 and 0.5
+        let pixels = [[255u8, 0, 0, 255], [64, 0, 0, 128]];
+        image::RgbaImage::from_fn(2, 1, |x, _| image::Rgba(pixels[x as usize])).save(&png).unwrap();
+
+        let material = |required: &str| {
+            format!(
+                r#"{{
+  "asset": {{ "version": "2.0" }},
+  "extensionsUsed": ["KHR_materials_clearcoat", "KHR_materials_sheen", "KHR_texture_transform"]{required},
+  "images": [{{ "uri": "{stem}.png" }}],
+  "textures": [{{ "source": 0 }}],
+  "materials": [
+    {{ "name": "velvet sofa with lacquered legs",
+       "extensions": {{
+         "KHR_materials_clearcoat": {{ "clearcoatFactor": 0.8, "clearcoatRoughnessFactor": 0.25,
+            "clearcoatTexture": {{ "index": 0,
+               "extensions": {{ "KHR_texture_transform": {{ "offset": [0.5, 0.0] }} }} }} }},
+         "KHR_materials_sheen": {{ "sheenColorFactor": [1.0, 0.5, 0.25], "sheenRoughnessFactor": 0.6,
+            "sheenRoughnessTexture": {{ "index": 0 }} }}
+       }} }},
+    {{ "name": "plain" }}
+  ]
+}}"#
+            )
+        };
+        let path = dir.join(format!("{stem}.gltf"));
+        std::fs::write(&path, material("")).unwrap();
+        let loaded = load(&path);
+        // the crate rejects the files that require an extension it does not know
+        std::fs::write(&path, material(r#", "extensionsRequired": ["KHR_materials_clearcoat"]"#)).unwrap();
+        let required = load(&path);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&png).ok();
+        assert!(required.is_err());
+        let materials = loaded.expect("the file must load").builder.materials;
+
+        let [sofa, plain] = &materials[..] else {
+            panic!("expected two materials");
+        };
+        assert_eq!((sofa.coat, sofa.coat_roughness, sofa.coat_ior), (0.8, 0.25, 1.5));
+        assert_eq!(sofa.sheen_color, Spectrum::new(1.0, 0.5, 0.25));
+        assert_eq!(sofa.sheen_roughness, 0.6);
+        assert!(sofa.coat_roughness_tex.is_none() && sofa.sheen_color_tex.is_none());
+        // the coat texture is shifted by half its width: the left half of the mesh UVs reads
+        // the right texel (red 64, linear), and the other way round
+        let coat_tex = sofa.coat_tex.as_ref().unwrap();
+        assert!(coat_tex.transform.is_some());
+        assert!((coat_tex.sample(Vec2::new(0.25, 0.5)).x - 64.0 / 255.0).abs() < 1e-5);
+        assert!((coat_tex.sample(Vec2::new(0.75, 0.5)).x - 1.0).abs() < 1e-5);
+        let roughness_tex = sofa.sheen_roughness_tex.as_ref().unwrap();
+        assert!((roughness_tex.sample(Vec2::new(0.75, 0.5)).w - 128.0 / 255.0).abs() < 1e-5);
+
+        assert_eq!((plain.coat, plain.sheen_color), (0.0, Spectrum::ZERO));
+        assert!(plain.coat_tex.is_none() && plain.sheen_roughness_tex.is_none());
     }
 }

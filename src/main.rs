@@ -1,9 +1,9 @@
 // This file is a part of SORT-rs, a Rust port of SORT (Simple Open Ray Tracing).
 
-use sort_rs::camera::Camera;
+use sort_rs::camera::{Camera, Projection};
 use sort_rs::light::{EnvMap, Light, Sky};
 use sort_rs::math::*;
-use sort_rs::render::{render, save_image, RenderSettings, ToneMap};
+use sort_rs::render::{render, save_image, Integrator, RenderSettings, ToneMap};
 use sort_rs::{demo, gltf_loader};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -20,13 +20,21 @@ USAGE:
 OPTIONS:
     -o, --output <file>       Output image, .png/.jpg (tone mapped) or .exr/.hdr (linear) [render.png]
     -w, --width <pixels>      Image width [1280]
-    -h, --height <pixels>     Image height [from the camera aspect ratio, else 720]
+    -h, --height <pixels>     Image height [from the camera aspect ratio, else 720; width/2 for a panorama]
     -s, --spp <count>         Samples per pixel [64]
     -d, --depth <count>       Maximum path depth [6]
+        --integrator <i>      pt (path tracing) or ao (ambient occlusion: a white \"clay\" render
+                              without materials or lights) [pt]
+        --ao-distance <m>     Distance within which geometry darkens a point (ao) [3]
         --camera <index>      Which camera of the file to use [0]
-        --fov <degrees>       Override the vertical field of view
-        --aperture <radius>   Lens radius for depth of field [0]
-        --focus <distance>    Focus distance for depth of field
+        --projection <p>      perspective, ortho or panorama (360 degrees, latitude-longitude)
+                              [the projection of the camera]
+        --ortho-height <m>    Height of the orthographic view in meters [the camera's if orthographic,
+                              else the whole scene when framed, else what the perspective camera
+                              sees at the distance of the scene's center]
+        --fov <degrees>       Override the vertical field of view (perspective)
+        --aperture <radius>   Lens radius for depth of field [0] (perspective)
+        --focus <distance>    Focus distance for depth of field (perspective)
         --sky <r,g,b>         Constant sky radiance
         --env <file.hdr>      HDR environment map (latitude-longitude)
         --env-intensity <f>   Environment map multiplier [1]
@@ -34,7 +42,7 @@ OPTIONS:
         --sun <az,el>         Add a sun, azimuth and elevation in degrees
         --sun-intensity <f>   Irradiance of the sun [20]
         --exposure <f>        Exposure multiplier [1]
-        --tonemap <aces|none> Tone mapping for .png/.jpg output [aces]
+        --tonemap <aces|none> Tone mapping for .png/.jpg output [aces, none with ao]
         --filter-glossy <f>   Blur of polished surfaces seen after a rough bounce, which turns
                               caustic fireflies into soft light; 0 renders caustics exactly [0.5]
         --clamp <f>           Clamp sample radiance to reduce fireflies (biased)
@@ -43,6 +51,13 @@ OPTIONS:
         --help                Print this message
 ";
 
+#[derive(Clone, Copy, PartialEq)]
+enum ProjectionArg {
+    Perspective,
+    Ortho,
+    Panorama,
+}
+
 struct Args {
     scene: Option<PathBuf>,
     demo: bool,
@@ -50,6 +65,8 @@ struct Args {
     width: u32,
     height: Option<u32>,
     camera: usize,
+    projection: Option<ProjectionArg>,
+    ortho_height: Option<f32>,
     fov: Option<f32>,
     aperture: f32,
     focus: Option<f32>,
@@ -60,7 +77,10 @@ struct Args {
     sun: Option<(f32, f32)>,
     sun_intensity: f32,
     exposure: f32,
-    tone_map: ToneMap,
+    /// `None` when not given: it then depends on the integrator.
+    tone_map: Option<ToneMap>,
+    ao: bool,
+    ao_distance: f32,
     threads: Option<usize>,
     settings: RenderSettings,
 }
@@ -81,6 +101,8 @@ fn parse_args() -> Result<Option<Args>, String> {
         width: 1280,
         height: None,
         camera: 0,
+        projection: None,
+        ortho_height: None,
         fov: None,
         aperture: 0.0,
         focus: None,
@@ -91,7 +113,9 @@ fn parse_args() -> Result<Option<Args>, String> {
         sun: None,
         sun_intensity: 20.0,
         exposure: 1.0,
-        tone_map: ToneMap::Aces,
+        tone_map: None,
+        ao: false,
+        ao_distance: 3.0,
         threads: None,
         settings: RenderSettings::default(),
     };
@@ -111,6 +135,15 @@ fn parse_args() -> Result<Option<Args>, String> {
             "-s" | "--spp" => args.settings.samples_per_pixel = num(&arg, value()?)?,
             "-d" | "--depth" => args.settings.max_depth = num(&arg, value()?)?,
             "--camera" => args.camera = num(&arg, value()?)?,
+            "--projection" => {
+                args.projection = Some(match value()?.as_str() {
+                    "perspective" => ProjectionArg::Perspective,
+                    "ortho" | "orthographic" => ProjectionArg::Ortho,
+                    "panorama" | "environment" => ProjectionArg::Panorama,
+                    other => return Err(format!("unknown projection '{other}'")),
+                })
+            }
+            "--ortho-height" => args.ortho_height = Some(num(&arg, value()?)?),
             "--fov" => args.fov = Some(num(&arg, value()?)?),
             "--aperture" => args.aperture = num(&arg, value()?)?,
             "--focus" => args.focus = Some(num(&arg, value()?)?),
@@ -128,12 +161,20 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--sun-intensity" => args.sun_intensity = num(&arg, value()?)?,
             "--exposure" => args.exposure = num(&arg, value()?)?,
             "--tonemap" => {
-                args.tone_map = match value()?.as_str() {
+                args.tone_map = Some(match value()?.as_str() {
                     "aces" => ToneMap::Aces,
                     "none" => ToneMap::None,
                     other => return Err(format!("unknown tone map '{other}'")),
+                })
+            }
+            "--integrator" => {
+                args.ao = match value()?.as_str() {
+                    "pt" | "path" => false,
+                    "ao" | "occlusion" => true,
+                    other => return Err(format!("unknown integrator '{other}'")),
                 }
             }
+            "--ao-distance" => args.ao_distance = num(&arg, value()?)?,
             "--clamp" => args.settings.clamp = Some(num(&arg, value()?)?),
             "--filter-glossy" => args.settings.filter_glossy = num(&arg, value()?)?,
             "--seed" => args.settings.seed = num(&arg, value()?)?,
@@ -149,6 +190,15 @@ fn parse_args() -> Result<Option<Args>, String> {
     if args.width == 0 || args.height == Some(0) {
         return Err("the image size must not be zero".into());
     }
+    if args.ortho_height.is_some_and(|h| !(h > 0.0)) {
+        return Err("the orthographic height must be positive".into());
+    }
+    if !(args.ao_distance > 0.0) {
+        return Err("the ambient occlusion distance must be positive".into());
+    }
+    if args.ao {
+        args.settings.integrator = Integrator::AmbientOcclusion { max_distance: args.ao_distance };
+    }
     Ok(Some(args))
 }
 
@@ -158,6 +208,7 @@ fn run(args: Args) -> Result<(), String> {
     }
 
     let start = Instant::now();
+    let panorama = args.projection == Some(ProjectionArg::Panorama);
     let (mut builder, camera) = match &args.scene {
         Some(path) => {
             let loaded = gltf_loader::load(path).map_err(|e| format!("failed to load {}: {e}", path.display()))?;
@@ -165,14 +216,16 @@ fn run(args: Args) -> Result<(), String> {
             if desc.is_none() && args.camera != 0 {
                 return Err(format!("the file has {} camera(s), index {} is out of range", loaded.cameras.len(), args.camera));
             }
-            let aspect = desc.and_then(|d| d.aspect_ratio).unwrap_or(16.0 / 9.0);
+            // a latitude-longitude panorama is 2:1 whatever the camera
+            let aspect = if panorama { 2.0 } else { desc.and_then(|d| d.aspect_ratio).unwrap_or(16.0 / 9.0) };
             let height = args.height.unwrap_or(((args.width as f32 / aspect).round() as u32).max(1));
             // without a camera in the file, the scene is framed once its bounds are known
             let camera = desc.map(|d| d.to_camera(args.width, height));
             (loaded.builder, camera.ok_or(height))
         }
         None => {
-            let height = args.height.unwrap_or((args.width * 9 / 16).max(1));
+            let default_height = if panorama { args.width / 2 } else { args.width * 9 / 16 };
+            let height = args.height.unwrap_or(default_height.max(1));
             let (builder, camera) = demo::interior(args.width, height);
             (builder, Ok(camera))
         }
@@ -204,7 +257,10 @@ fn run(args: Args) -> Result<(), String> {
     }
     let has_emitters = builder.materials.iter().any(|m| m.is_emissive());
     if builder.lights.is_empty() && !has_emitters {
-        eprintln!("note: the scene has no light, adding a uniform white sky (see --sky, --env and --sun)");
+        // ambient occlusion ignores lights, the sky is harmless there
+        if !args.ao {
+            eprintln!("note: the scene has no light, adding a uniform white sky (see --sky, --env and --sun)");
+        }
         builder.add_light(Light::Sky(Sky { intensity: Vec3::ONE, env: None, rotation: 0.0 }));
     }
 
@@ -221,13 +277,16 @@ fn run(args: Args) -> Result<(), String> {
         start.elapsed()
     );
 
+    // radius of the bounding sphere when the camera frames the whole scene
+    let mut framed_radius = None;
     let mut camera = match camera {
         Ok(camera) => camera,
         Err(height) => {
-            eprintln!("note: the file has no perspective camera, framing the whole scene");
+            eprintln!("note: the file has no camera, framing the whole scene");
             let center = scene.bbox.center();
             let radius = (scene.bbox.max - scene.bbox.min).length() * 0.5;
             let eye = center + Vec3::new(1.0, 0.6, 1.0).normalize() * radius * 2.2;
+            framed_radius = Some(radius);
             Camera::look_at(eye, center, Vec3::Y, 40f32.to_radians(), args.width, height)
         }
     };
@@ -238,11 +297,47 @@ fn run(args: Args) -> Result<(), String> {
     if let Some(focus) = args.focus {
         camera.focal_distance = focus;
     }
+    camera.projection = match (args.projection, camera.projection) {
+        (Some(ProjectionArg::Perspective), _) => Projection::Perspective,
+        (Some(ProjectionArg::Panorama), _) => Projection::Environment,
+        (Some(ProjectionArg::Ortho), current) | (None, current @ Projection::Orthographic { .. }) => {
+            let height = match (args.ortho_height, current, framed_radius) {
+                (Some(height), _, _) => height,
+                (None, Projection::Orthographic { height }, _) => height,
+                // the bounding sphere fits both vertically and horizontally
+                (None, _, Some(radius)) => 2.0 * radius * (camera.height as f32 / camera.width as f32).max(1.0),
+                // What the perspective camera sees at the distance of the scene's center. Its
+                // focal distance is no guide: glTF cameras have none and get 1.
+                (None, _, None) => {
+                    let along = (scene.bbox.center() - camera.eye).dot(camera.forward);
+                    let distance = match args.focus {
+                        Some(focus) => focus,
+                        None if along > 0.0 => along,
+                        None => camera.focal_distance,
+                    };
+                    2.0 * distance * (camera.fov_y * 0.5).tan()
+                }
+            };
+            Projection::Orthographic { height }
+        }
+        (None, current) => current,
+    };
 
-    eprintln!(
-        "rendering {}x{} at {} spp, depth {}",
-        camera.width, camera.height, args.settings.samples_per_pixel, args.settings.max_depth
-    );
+    let view = match camera.projection {
+        Projection::Perspective => "perspective".to_string(),
+        Projection::Orthographic { height } => format!("orthographic ({height:.2} m high)"),
+        Projection::Environment => "panorama".to_string(),
+    };
+    match args.settings.integrator {
+        Integrator::PathTracing => eprintln!(
+            "rendering {}x{} {view} at {} spp, depth {}",
+            camera.width, camera.height, args.settings.samples_per_pixel, args.settings.max_depth
+        ),
+        Integrator::AmbientOcclusion { max_distance } => eprintln!(
+            "rendering {}x{} {view} at {} spp, ambient occlusion within {max_distance} m",
+            camera.width, camera.height, args.settings.samples_per_pixel
+        ),
+    }
     let start = Instant::now();
     let last_percent = AtomicU32::new(0);
     let pixels = render(&scene, &camera, &args.settings, |fraction| {
@@ -253,7 +348,9 @@ fn run(args: Args) -> Result<(), String> {
     });
     eprintln!("rendered in {:.2?}", start.elapsed());
 
-    save_image(&args.output, &pixels, camera.width, camera.height, args.exposure, args.tone_map)
+    // ambient occlusion is display-referred already, ACES would grey its white
+    let tone_map = args.tone_map.unwrap_or(if args.ao { ToneMap::None } else { ToneMap::Aces });
+    save_image(&args.output, &pixels, camera.width, camera.height, args.exposure, tone_map)
         .map_err(|e| format!("failed to write {}: {e}", args.output.display()))?;
     eprintln!("wrote {}", args.output.display());
     Ok(())

@@ -4,7 +4,7 @@
 //! Multi-threaded rendering loop and image output.
 
 use crate::camera::Camera;
-use crate::integrator::PathTracing;
+use crate::integrator::{AmbientOcclusion, PathTracing};
 use crate::math::*;
 use crate::rng::Rng;
 use crate::scene::Scene;
@@ -12,20 +12,55 @@ use rayon::prelude::*;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// What computes the radiance of a camera ray.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Integrator {
+    /// Global illumination, see `integrator::PathTracing`.
+    PathTracing,
+    /// Clay render, see `integrator::AmbientOcclusion`.
+    AmbientOcclusion { max_distance: f32 },
+}
+
 #[derive(Clone, Debug)]
 pub struct RenderSettings {
     pub samples_per_pixel: u32,
+    /// Path tracing only.
     pub max_depth: u32,
     /// Clamp the radiance of each sample to this value. Removes fireflies at the cost of bias.
     pub clamp: Option<f32>,
-    /// Blur of the surfaces met after a rough bounce, see `PathTracing::filter_glossy`.
+    /// Blur of the surfaces met after a rough bounce, see `PathTracing::filter_glossy`. Path
+    /// tracing only.
     pub filter_glossy: f32,
     pub seed: u64,
+    pub integrator: Integrator,
 }
 
 impl Default for RenderSettings {
     fn default() -> Self {
-        Self { samples_per_pixel: 64, max_depth: 6, clamp: None, filter_glossy: 0.5, seed: 0 }
+        Self {
+            samples_per_pixel: 64,
+            max_depth: 6,
+            clamp: None,
+            filter_glossy: 0.5,
+            seed: 0,
+            integrator: Integrator::PathTracing,
+        }
+    }
+}
+
+/// The integrator, built once per render.
+enum Active {
+    PathTracing(PathTracing),
+    AmbientOcclusion(AmbientOcclusion),
+}
+
+impl Active {
+    #[inline]
+    fn li(&self, ray: &Ray, scene: &Scene, rng: &mut Rng) -> Spectrum {
+        match self {
+            Active::PathTracing(pt) => pt.li(ray, scene, rng),
+            Active::AmbientOcclusion(ao) => ao.li(ray, scene, rng),
+        }
     }
 }
 
@@ -38,8 +73,15 @@ pub fn render(
     progress: impl Fn(f32) + Sync,
 ) -> Vec<Spectrum> {
     let (width, height) = (camera.width as usize, camera.height as usize);
-    let integrator =
-        PathTracing { max_recursive_depth: settings.max_depth, filter_glossy: settings.filter_glossy };
+    let integrator = match settings.integrator {
+        Integrator::PathTracing => Active::PathTracing(PathTracing {
+            max_recursive_depth: settings.max_depth,
+            filter_glossy: settings.filter_glossy,
+        }),
+        Integrator::AmbientOcclusion { max_distance } => {
+            Active::AmbientOcclusion(AmbientOcclusion { max_distance })
+        }
+    };
     let spp = settings.samples_per_pixel.max(1);
     let done = AtomicUsize::new(0);
 
@@ -129,8 +171,9 @@ pub fn save_image(
 mod tests {
     use super::*;
     use crate::light::{Light, Sky};
-    use crate::material::Material;
+    use crate::material::{AlphaMode, Cloth, Material, Texture};
     use crate::scene::SceneBuilder;
+    use std::sync::Arc;
 
     fn floor(builder: &mut SceneBuilder, material: u32) {
         let s = 500.0;
@@ -161,6 +204,72 @@ mod tests {
         let result = center_pixel(&scene, 4000, 6);
         // Disney diffuse with retro-reflection is not exactly Lambertian, allow some slack
         assert!((result - albedo).abs().max_element() < 0.06, "got {result:?}, expected {albedo:?}");
+    }
+
+    /// Coats, sheens and cloths never reflect more than they receive, under a uniform sky of
+    /// radiance 1, and a clear coat over a white diffuse base keeps nearly all of its light.
+    #[test]
+    fn layered_and_cloth_furnace() {
+        let white = Material { base_color: Spectrum::ONE, specular: 0.0, roughness: 1.0, ..Default::default() };
+        let measure = |material: Material| {
+            let mut builder = SceneBuilder::new();
+            let id = builder.add_material(material);
+            floor(&mut builder, id);
+            builder.add_light(Light::Sky(Sky { intensity: Spectrum::ONE, env: None, rotation: 0.0 }));
+            center_pixel(&builder.build(), 4000, 6).max_element()
+        };
+
+        let bare = measure(white.clone());
+        let coated = measure(Material { coat: 1.0, coat_roughness: 0.2, ..white.clone() });
+        // The coat moves light from the base to its own reflection; the light it reflects
+        // back down is returned to the base (exactly so for a Lambertian one). What is left is
+        // what the GGX top loses to masking, a fraction of a percent here, plus noise: within
+        // 3% of all the light. The bare Disney base reflects a few percent more than it
+        // receives seen from above (its retro-reflection), which the coat hides: it is
+        // seen through the layer at angles where that term is negligible.
+        assert!(coated > 0.97 && coated < 1.02, "coated {coated}");
+        assert!(coated > bare - 0.05, "coated {coated}, bare {bare}");
+
+        let sheen = measure(Material { sheen_color: Spectrum::ONE, sheen_roughness: 0.5, ..white.clone() });
+        assert!(sheen > 0.1 && sheen < 1.02, "sheen {sheen}");
+        let cloths = [
+            Cloth::Fabric { roughness: 0.3 },
+            Cloth::Distribution { roughness: 0.5, specular: 0.5, specular_tint: 0.0 },
+            Cloth::Distribution { roughness: 0.8, specular: 1.0, specular_tint: 1.0 },
+        ];
+        for cloth in cloths {
+            let value = measure(Material { cloth: Some(cloth), ..white.clone() });
+            assert!(value > 0.1 && value < 1.02, "{cloth:?}: {value}");
+        }
+    }
+
+    /// A sheet black on the front and white on the back (`Material::back_material`).
+    #[test]
+    fn back_material_shades_the_back_face() {
+        let mut builder = SceneBuilder::new();
+        let back = builder.add_material(Material { base_color: Spectrum::splat(0.5), specular: 0.0, roughness: 1.0, ..Default::default() });
+        let front = builder.add_material(Material {
+            base_color: Spectrum::ZERO,
+            specular: 0.0,
+            back_material: Some(back),
+            ..Default::default()
+        });
+        let broken = builder.add_material(Material { back_material: Some(99), ..Default::default() });
+        // facing up
+        floor(&mut builder, front);
+        builder.add_light(Light::Sky(Sky { intensity: Spectrum::ONE, env: None, rotation: 0.0 }));
+        let scene = builder.build();
+        assert_eq!(scene.materials[broken as usize].back_material, None);
+
+        let settings = RenderSettings { samples_per_pixel: 2000, max_depth: 6, ..Default::default() };
+        let look = |eye: Vec3| {
+            let camera = Camera::look_at(eye, Vec3::ZERO, Vec3::Z, 0.01, 3, 3);
+            render(&scene, &camera, &settings, |_| {})[4]
+        };
+        let above = look(Vec3::new(0.0, 3.0, 0.0));
+        let below = look(Vec3::new(0.0, -3.0, 0.0));
+        assert!(above.max_element() < 1e-3, "front: {above}");
+        assert!((below - Spectrum::splat(0.5)).abs().max_element() < 0.04, "back: {below}");
     }
 
     /// A distant light at an angle gives E * cos / pi * albedo for a diffuse surface.
@@ -312,5 +421,167 @@ mod tests {
         // light crosses the pane twice: on the way down and on the way back to the camera
         let expected = open * 0.96 * 0.96;
         assert!((glazed - expected).abs() < 0.05 * expected, "behind glass: {glazed}, expected about {expected}");
+    }
+
+    /// The pixel straight below a camera at `eye` looking down.
+    fn pixel_below(scene: &Scene, eye: Vec3, spp: u32, depth: u32) -> Spectrum {
+        let camera = Camera::look_at(eye, eye - Vec3::Y, Vec3::Z, 0.01, 3, 3);
+        let settings = RenderSettings { samples_per_pixel: spp, max_depth: depth, ..Default::default() };
+        render(scene, &camera, &settings, |_| {})[4]
+    }
+
+    /// A masked quad is a hole where its alpha is below the cutoff: it casts the shadow of its
+    /// opaque half only, and the camera sees the floor through the other half.
+    #[test]
+    fn alpha_cutout_is_a_hole() {
+        let build = |with_quad: bool| {
+            let mut builder = SceneBuilder::new();
+            let diffuse = builder.add_material(Material { base_color: Spectrum::splat(0.5), specular: 0.0, roughness: 1.0, ..Default::default() });
+            floor(&mut builder, diffuse);
+            if with_quad {
+                // opaque for u in (0, 0.5), a hole for u in (0.5, 1): the bilinear filter
+                // crosses the cutoff halfway between the texel centers at u = 0.25 and 0.75
+                let texture = Arc::new(Texture {
+                    width: 2,
+                    height: 1,
+                    data: vec![[255, 255, 255, 255], [255, 255, 255, 0]],
+                    srgb: true,
+                });
+                let leaf = builder.add_material(Material {
+                    base_color: Spectrum::splat(0.9),
+                    base_color_tex: Some(texture.into()),
+                    alpha_mode: AlphaMode::Mask { cutoff: 0.5 },
+                    ..Default::default()
+                });
+                // u goes from x = -2 to x = 2
+                let s = 2.0;
+                builder.add_quad(
+                    [Vec3::new(-s, 1.0, s), Vec3::new(s, 1.0, s), Vec3::new(s, 1.0, -s), Vec3::new(-s, 1.0, -s)],
+                    leaf,
+                );
+            }
+            builder.add_light(Light::Distant { dir: -Vec3::Y, intensity: Spectrum::splat(PI) });
+            builder.build()
+        };
+        let (open, scene) = (build(false), build(true));
+        let (opaque, hole) = (Vec3::new(-1.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0));
+        let below_quad = Vec3::new(0.0, 0.5, 0.0);
+
+        let lit = pixel_below(&open, hole + below_quad, 64, 1).x;
+        assert!(lit > 0.3, "open floor: {lit}");
+        let shadow = pixel_below(&scene, opaque + below_quad, 64, 1).x;
+        assert!(shadow == 0.0, "under the opaque half: {shadow}");
+        let through = pixel_below(&scene, hole + below_quad, 64, 1).x;
+        assert!((through - lit).abs() < 1e-3 * lit, "under the hole: {through}, open floor {lit}");
+
+        // seen from above, the camera ray goes through the hole down to the floor
+        let above = Vec3::new(0.0, 3.0, 0.0);
+        let hit = scene.intersect(&Ray::new(hole + above, -Vec3::Y, 0.0, f32::MAX)).unwrap();
+        assert!((hit.t - 3.0).abs() < 1e-4, "hit at {}", hit.t);
+        let seen = pixel_below(&scene, hole + above, 64, 1).x;
+        assert!((seen - lit).abs() < 1e-3 * lit, "through the hole: {seen}, open floor {lit}");
+        let hit = scene.intersect(&Ray::new(opaque + above, -Vec3::Y, 0.0, f32::MAX)).unwrap();
+        assert!((hit.t - 2.0).abs() < 1e-4, "hit at {}", hit.t);
+    }
+
+    /// A black quad covering half of each point lets half of the light through on the way
+    /// down to the floor and half of it on the way back to the camera.
+    #[test]
+    fn alpha_blend_is_partial_coverage() {
+        let build = |with_quad: bool| {
+            let mut builder = SceneBuilder::new();
+            let diffuse = builder.add_material(Material { base_color: Spectrum::splat(0.5), specular: 0.0, roughness: 1.0, ..Default::default() });
+            floor(&mut builder, diffuse);
+            if with_quad {
+                let sheer = builder.add_material(Material {
+                    base_color: Spectrum::ZERO,
+                    specular: 0.0,
+                    roughness: 1.0,
+                    alpha: 0.5,
+                    alpha_mode: AlphaMode::Blend,
+                    ..Default::default()
+                });
+                let s = 500.0;
+                builder.add_quad(
+                    [Vec3::new(-s, 1.0, s), Vec3::new(s, 1.0, s), Vec3::new(s, 1.0, -s), Vec3::new(-s, 1.0, -s)],
+                    sheer,
+                );
+            }
+            let dir = Vec3::new(-1.0, -1.0, 0.0).normalize();
+            builder.add_light(Light::Distant { dir, intensity: Spectrum::splat(PI) });
+            builder.build()
+        };
+
+        // as for thin glass, depth 2 is the floor's direct light seen through the quad
+        let open = center_pixel(&build(false), 256, 2).x;
+        let covered = center_pixel(&build(true), 8000, 2).x;
+        assert!(open > 0.3, "open floor: {open}");
+        let expected = open * 0.25;
+        assert!((covered - expected).abs() < 0.05 * expected, "under the quad: {covered}, expected about {expected}");
+    }
+
+    fn ao_center_pixel(scene: &Scene, spp: u32, max_distance: f32) -> Spectrum {
+        let camera = Camera::look_at(Vec3::new(0.0, 3.0, 0.0), Vec3::ZERO, Vec3::Z, 0.01, 3, 3);
+        let settings = RenderSettings {
+            samples_per_pixel: spp,
+            integrator: Integrator::AmbientOcclusion { max_distance },
+            ..Default::default()
+        };
+        render(scene, &camera, &settings, |_| {})[4]
+    }
+
+    /// Nothing around an open floor occludes it: ambient occlusion is exactly white.
+    #[test]
+    fn ambient_occlusion_of_an_open_floor_is_white() {
+        let mut builder = SceneBuilder::new();
+        let material = builder.add_material(Material::default());
+        floor(&mut builder, material);
+        let scene = builder.build();
+        assert_eq!(ao_center_pixel(&scene, 64, 3.0), Spectrum::ONE);
+    }
+
+    /// A ceiling counts only when it is closer than the occlusion distance.
+    #[test]
+    fn ambient_occlusion_respects_the_distance() {
+        let mut builder = SceneBuilder::new();
+        let material = builder.add_material(Material::default());
+        floor(&mut builder, material);
+        let (s, h) = (4000.0, 10.0);
+        builder.add_quad(
+            [Vec3::new(-s, h, -s), Vec3::new(s, h, -s), Vec3::new(s, h, s), Vec3::new(-s, h, s)],
+            material,
+        );
+        let scene = builder.build();
+
+        assert_eq!(ao_center_pixel(&scene, 64, 0.5 * h).x, 1.0);
+        // only directions within a hair of the horizon escape a ceiling that wide
+        let closed = ao_center_pixel(&scene, 1000, 1e5 * h).x;
+        assert!(closed < 0.01, "under the ceiling: {closed}");
+    }
+
+    /// Thin glass between the camera and the floor, and over the floor, attenuates instead of
+    /// occluding.
+    #[test]
+    fn ambient_occlusion_sees_through_thin_glass() {
+        let mut builder = SceneBuilder::new();
+        let diffuse = builder.add_material(Material::default());
+        floor(&mut builder, diffuse);
+        let glass = builder.add_material(Material {
+            base_color: Spectrum::ONE,
+            transmission: 1.0,
+            thin: true,
+            roughness: 0.0,
+            ..Default::default()
+        });
+        let s = 500.0;
+        builder.add_quad(
+            [Vec3::new(-s, 1.0, s), Vec3::new(s, 1.0, s), Vec3::new(s, 1.0, -s), Vec3::new(-s, 1.0, -s)],
+            glass,
+        );
+        let scene = builder.build();
+
+        let glazed = ao_center_pixel(&scene, 256, 3.0).x;
+        // once through the pane for the camera, once for every occlusion ray
+        assert!(glazed > 0.8 && glazed <= 1.0, "behind glass: {glazed}");
     }
 }

@@ -470,7 +470,20 @@ impl Disney {
         }
     }
 
+    #[inline]
     pub fn f(&self, wo: Vec3, wi: Vec3) -> Spectrum {
+        self.evaluate(wo, wi).0
+    }
+
+    /// Diffuse albedo, the reflectance of the diffuse lobe of a non-metallic, opaque surface.
+    #[inline]
+    fn diffuse_albedo(&self) -> Spectrum {
+        self.basecolor * ((1.0 - self.metallic) * (1.0 - self.spec_trans))
+    }
+
+    /// The BRDF value, and the part of it that comes from the diffuse lobes (diffuse,
+    /// retro-reflection and sheen), which `Coat` needs on its own.
+    fn evaluate(&self, wo: Vec3, wi: Vec3) -> (Spectrum, Spectrum) {
         let diffuse_weight = (1.0 - self.metallic) * (1.0 - self.spec_trans);
 
         let wh = (wo + wi).normalize_or_zero();
@@ -528,6 +541,7 @@ impl Disney {
                 ret += diffuse_weight * clamped_n_o_i * fh * self.sheen * csheen;
             }
         }
+        let diffuse = ret;
 
         // Specular reflection
         let ggx = self.ggx();
@@ -568,7 +582,7 @@ impl Disney {
             ret += self.diff_trans * diffuse_weight * lambert_transmission_f(self.basecolor, wo, wi);
         }
 
-        ret
+        (ret, diffuse)
     }
 
     pub fn sample(&self, wo: Vec3, bs: (f32, f32), rng: &mut Rng) -> Option<(Spectrum, Vec3, f32)> {
@@ -685,6 +699,305 @@ fn lambert_transmission_pdf(wo: Vec3, wi: Vec3) -> f32 {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Coat ( coat.cpp )
+// ---------------------------------------------------------------------------------------------
+
+/// A layer of clear or tinted dielectric (varnish, lacquer) over a base, after 'Arbitrarily
+/// Layered Micro-Facet Surfaces' (Weidlich and Wilkie 2007), as SORT implements it: a GGX
+/// dielectric reflection on top, and the base evaluated with the directions refracted into the
+/// layer, attenuated by the Fresnel transmission both ways and by absorption in the layer.
+///
+/// In SORT the base is any closure tree. Here it is the Disney BRDF, the only base a
+/// `Material` produces, so that BXDFs stay plain values. Like SORT's, the coat only reflects:
+/// the transmission of the base is dropped.
+#[derive(Clone, Copy, Debug)]
+pub struct Coat {
+    bottom: Disney,
+    roughness: f32,
+    ior: f32,
+    sigma: Spectrum,
+    /// Fraction of the diffuse light inside the layer that its top reflects back down,
+    /// total internal reflection included.
+    internal_reflectance: f32,
+}
+
+impl Coat {
+    /// `roughness` is the roughness of the top of the layer, `ior` its index of refraction
+    /// (at least 1) and `sigma` the absorption coefficient of the layer, whose thickness is 1
+    /// as in SORT: light crossing it straight down and up keeps `exp(-2 sigma)`.
+    pub fn new(bottom: Disney, roughness: f32, ior: f32, sigma: Spectrum) -> Self {
+        let ior = ior.max(1.0);
+        // 1 - r_i = (1 - r_e) / ior^2, with r_e the cosine weighted average of the Fresnel
+        // reflectance from outside: the exact escape probability of light that is diffuse
+        // inside the layer, for the transmittance `f` uses.
+        const STEPS: usize = 64;
+        let external: f32 = (0..STEPS)
+            .map(|k| dielectric_fresnel(((k as f32 + 0.5) / STEPS as f32).sqrt(), 1.0, ior))
+            .sum::<f32>()
+            / STEPS as f32;
+        let internal_reflectance = 1.0 - (1.0 - external) / (ior * ior);
+        Self { bottom, roughness, ior, sigma: sigma.max(Spectrum::ZERO), internal_reflectance }
+    }
+
+    #[inline]
+    fn top(&self) -> MicrofacetReflection {
+        MicrofacetReflection {
+            r: Spectrum::ONE,
+            dist: Ggx::new(self.roughness, self.roughness),
+            fresnel: Fresnel::Dielectric { eta_i: 1.0, eta_t: self.ior },
+        }
+    }
+
+    /// Direction inside the layer of a direction above it.
+    #[inline]
+    fn inside(&self, w: Vec3) -> Vec3 {
+        // never fails, light enters a denser medium
+        -refract(w, Vec3::Y, self.ior, 1.0).unwrap_or(-Vec3::Y)
+    }
+
+    /// Direction above the layer of a direction inside it, `None` past the critical angle.
+    #[inline]
+    fn outside(&self, u: Vec3) -> Option<Vec3> {
+        refract(-u, Vec3::Y, self.ior, 1.0).filter(|w| w.y > 0.0)
+    }
+
+    #[inline]
+    fn fresnel(&self, cos: f32) -> f32 {
+        dielectric_fresnel(cos, 1.0, self.ior)
+    }
+
+    /// Probability of sampling the top layer, from the energy reflected by the top and the
+    /// energy the base gets back through a white base, as in SORT.
+    fn top_probability(&self, wo: Vec3) -> f32 {
+        let uo = self.inside(wo);
+        let attenuation = (-2.0 * self.sigma / uo.y).exp();
+        let i1 = self.fresnel(wo.y);
+        let i2 = sqr(1.0 - i1) * intensity(attenuation) / sqr(self.ior);
+        if i1 + i2 > 0.0 {
+            i1 / (i1 + i2)
+        } else {
+            1.0
+        }
+    }
+
+    pub fn f(&self, wo: Vec3, wi: Vec3) -> Spectrum {
+        if !same_hemisphere(wo, wi) || cos_theta(wo) <= 0.0 {
+            return Spectrum::ZERO;
+        }
+        let ret = self.top().f(wo, wi);
+
+        let (uo, ui) = (self.inside(wo), self.inside(wi));
+        let (bottom, diffuse) = self.bottom.evaluate(uo, ui);
+        if is_black(bottom) {
+            return ret;
+        }
+        // Bouguer-Lambert-Beer law
+        let attenuation = (-self.sigma * (1.0 / uo.y + 1.0 / ui.y)).exp();
+        // Fresnel transmission into the layer and out of it
+        let t12 = 1.0 - self.fresnel(wo.y);
+        let t21 = 1.0 - self.fresnel(wi.y);
+
+        // The light the top reflects back down (total internal reflection) is not lost: it
+        // bounces off the base again, and so on. For the diffuse part of the base, of albedo
+        // A, the bounces sum to 1 / (1 - A r_i), with the round trips through the layer
+        // attenuated by exp(-4 sigma), the mean over diffuse light (a lower bound of it).
+        // This is exact for a Lambertian base and keeps a white one white. SORT adds a fixed
+        // 0.2 to the transmittance out of the layer instead (TIR_COMPENSATION), which still
+        // loses about 30% of the light of a white base at an index of 1.5.
+        let trapped = self.bottom.diffuse_albedo().clamp(Spectrum::ZERO, Spectrum::ONE)
+            * (self.internal_reflectance * (-4.0 * self.sigma).exp());
+        let gain = Spectrum::ONE / (Spectrum::ONE - trapped);
+
+        // `bottom` holds the cosine of the refracted direction. Radiance is compressed by
+        // ior^2 entering the layer and expanded back leaving it, and the solid angles map by
+        // cos_i d_wi = ior^2 cos_t d_wt: the cosine that belongs here is the one outside.
+        // SORT keeps the refracted one, which creates energy for an index close to 1.
+        let scale = t12 * t21 * cos_theta(wi) / (ui.y * sqr(self.ior));
+        ret + (bottom + diffuse * (gain - Spectrum::ONE)) * attenuation * scale
+    }
+
+    pub fn sample(&self, wo: Vec3, bs: (f32, f32), rng: &mut Rng) -> Option<(Spectrum, Vec3, f32)> {
+        if cos_theta(wo) <= 0.0 {
+            return None;
+        }
+        let wi = if rng.f32() < self.top_probability(wo) {
+            reflect(wo, self.top().dist.sample(bs))
+        } else {
+            let (_, ui, _) = self.bottom.sample(self.inside(wo), bs, rng)?;
+            if ui.y <= 0.0 {
+                return None;
+            }
+            self.outside(ui)?
+        };
+        let pdf = self.pdf(wo, wi);
+        if !(pdf > 0.0) {
+            return None;
+        }
+        Some((self.f(wo, wi), wi, pdf))
+    }
+
+    pub fn pdf(&self, wo: Vec3, wi: Vec3) -> f32 {
+        if !same_hemisphere(wo, wi) || cos_theta(wo) <= 0.0 {
+            return 0.0;
+        }
+        let top = self.top().pdf(wo, wi);
+        let (uo, ui) = (self.inside(wo), self.inside(wi));
+        // The pdf of the base is w.r.t. the solid angle inside the layer; SORT mixes it with
+        // the pdf of the top as it is, here it is changed to the solid angle outside.
+        let bottom = self.bottom.pdf(uo, ui) * cos_theta(wi) / (ui.y * sqr(self.ior));
+        lerp(bottom, top, self.top_probability(wo))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fabric ( fabric.cpp )
+// ---------------------------------------------------------------------------------------------
+
+/// The fabric BRDF of 'Physically Based Shading at DreamWorks Animation' (2017): a lobe
+/// around the plane perpendicular to the threads, which run along the tangent.
+#[derive(Clone, Copy, Debug)]
+pub struct Fabric {
+    pub base_color: Spectrum,
+    pub roughness: f32,
+}
+
+impl Fabric {
+    #[inline]
+    fn exponent(&self) -> f32 {
+        (1.0 + 29.0 * sqr(1.0 - saturate(self.roughness))).ceil()
+    }
+
+    pub fn f(&self, wo: Vec3, wi: Vec3) -> Spectrum {
+        if !same_hemisphere(wo, wi) || cos_theta(wo) <= 0.0 {
+            return Spectrum::ZERO;
+        }
+        let n = self.exponent();
+        let h = (wo + wi).normalize_or_zero();
+        self.base_color * ((1.0 - h.x.abs()).powf(n) * abs_cos_theta(wi) / fabric_normalization(n))
+    }
+
+    pub fn sample(&self, wo: Vec3, bs: (f32, f32), rng: &mut Rng) -> Option<(Spectrum, Vec3, f32)> {
+        if cos_theta(wo) <= 0.0 {
+            return None;
+        }
+        // The pdf of the micro-normal is (n + 1) (1 - |h.x|)^n / 2 pi: |h.x| is sampled by
+        // inverting its distribution and the angle around the x axis is uniform.
+        let n = self.exponent();
+        let sign = if rng.f32() > 0.5 { 1.0 } else { -1.0 };
+        let sin_theta_h = sign * saturate(1.0 - bs.0.powf(1.0 / (n + 1.0)));
+        let cos_theta_h = saturate(1.0 - sqr(sin_theta_h)).sqrt();
+        let (sin_phi, cos_phi) = (PI * bs.1).sin_cos();
+        let wh = Vec3::new(sin_theta_h, cos_theta_h * sin_phi, cos_theta_h * cos_phi);
+        let wi = reflect(wo, wh);
+        let pdf = self.pdf(wo, wi);
+        if !(pdf > 0.0) {
+            return None;
+        }
+        Some((self.f(wo, wi), wi, pdf))
+    }
+
+    pub fn pdf(&self, wo: Vec3, wi: Vec3) -> f32 {
+        if !same_hemisphere(wo, wi) || cos_theta(wo) <= 0.0 {
+            return 0.0;
+        }
+        let n = self.exponent();
+        let wh = (wo + wi).normalize_or_zero();
+        let o_o_h = wo.dot(wh);
+        if o_o_h <= 0.0 {
+            return 0.0;
+        }
+        (n + 1.0) * (1.0 - wh.x.abs()).powf(n) * INV_TWOPI / (4.0 * o_o_h)
+    }
+}
+
+/// Albedo of the fabric lobe `(1 - |h.x|)^n cos_i` for exponents 1 to 30, at normal incidence,
+/// which is where it is the largest: dividing by it keeps the albedo at or below the base color.
+///
+/// SORT divides by a table (`g_fabric_lut`, from `fabric_brdf_lut.py`) that integrates an
+/// approximation of the lobe, `(1 - sin(theta / 2))^n` without the `sin(theta)` of the solid
+/// angle; it is about 7 to 21% too large, so SORT's fabric is that much darker than its base color.
+/// These values are the exact integral, by quadrature.
+const FABRIC_ALBEDO: [f32; 30] = [
+    2.38734, 1.89490, 1.55650, 1.31349, 1.13234, 0.99302, 0.88301, 0.79419, 0.72114, 0.66008, 0.60835,
+    0.56398, 0.52554, 0.49193, 0.46230, 0.43599, 0.41248, 0.39135, 0.37226, 0.35493, 0.33913, 0.32466,
+    0.31137, 0.29912, 0.28779, 0.27728, 0.26750, 0.25839, 0.24988, 0.24190,
+];
+
+#[inline]
+fn fabric_normalization(n: f32) -> f32 {
+    FABRIC_ALBEDO[(n as usize).clamp(1, 30) - 1]
+}
+
+// ---------------------------------------------------------------------------------------------
+// Distribution BRDF ( distributionbrdf.cpp )
+// ---------------------------------------------------------------------------------------------
+
+/// The scaling factor of the inverted Gaussian, as in the original paper.
+const DISTRIBUTION_A: f32 = 4.0;
+
+/// Ashikhmin and Premoze's distribution-based BRDF with the inverted Gaussian of 'Crafting a
+/// Next-Gen Material Pipeline for The Order: 1886' (2013): cloth that brightens at grazing
+/// angles (velvet, satin, upholstery).
+#[derive(Clone, Copy, Debug)]
+pub struct DistributionBrdf {
+    pub base_color: Spectrum,
+    pub roughness: f32,
+    /// Fresnel reflectance of the cloth lobe at normal incidence; the rest is diffuse.
+    pub specular: f32,
+    /// Tints the cloth lobe towards the base color.
+    pub specular_tint: f32,
+}
+
+impl DistributionBrdf {
+    /// Width of the inverted Gaussian, 1 - roughness^2 in SORT: a rough cloth has its sheen
+    /// close to the silhouette, a smooth one spreads it.
+    #[inline]
+    fn alpha2(&self) -> f32 {
+        sqr(1.0 - sqr(self.roughness.clamp(1e-3, 1.0)))
+    }
+
+    /// The inverted Gaussian, eq. 22 of the paper, normalized over the projected area.
+    fn d(&self, h: Vec3) -> f32 {
+        let alpha2 = self.alpha2();
+        let cos2 = cos_theta2(h);
+        let sin2 = sin_theta2(h);
+        // exp(-cot^2 / alpha^2) / sin^4 vanishes at the normal; SORT computes it as 0 / 0
+        let peak = if sin2 > 0.0 && alpha2 > 0.0 { (-cos2 / (sin2 * alpha2)).exp() / sqr(sin2) } else { 0.0 };
+        (1.0 + DISTRIBUTION_A * peak) / (PI * (1.0 + DISTRIBUTION_A * alpha2))
+    }
+
+    pub fn f(&self, wo: Vec3, wi: Vec3) -> Spectrum {
+        if !same_hemisphere(wo, wi) || cos_theta(wo) <= 0.0 {
+            return Spectrum::ZERO;
+        }
+        let o_o_n = abs_cos_theta(wo);
+        let i_o_n = abs_cos_theta(wi);
+        let mut wh = (wo + wi).normalize_or_zero();
+        if wh == Vec3::ZERO {
+            wh = Vec3::Y;
+        }
+        let i_o_h = wi.dot(wh);
+        let fresnel = self.specular + schlick_weight(i_o_h) * (1.0 - self.specular);
+        let sr = lerp3(Spectrum::ONE, self.base_color, self.specular_tint);
+        let diffuse = self.base_color * INV_PI;
+        let cloth = sr * (self.d(wh) / (4.0 * (o_o_n + i_o_n - o_o_n * i_o_n)));
+        lerp3(diffuse, cloth, fresnel) * i_o_n
+    }
+
+    /// Cosine weighted sampling, as SORT does: the importance sampling it wrote for the
+    /// inverted Gaussian is commented out there, being noisier.
+    pub fn sample(&self, wo: Vec3, bs: (f32, f32)) -> Option<(Spectrum, Vec3, f32)> {
+        let wi = cos_sample_hemisphere(bs.0, bs.1);
+        let pdf = self.pdf(wo, wi);
+        (pdf > 0.0).then(|| (self.f(wo, wi), wi, pdf))
+    }
+
+    pub fn pdf(&self, wo: Vec3, wi: Vec3) -> f32 {
+        lambert_pdf(wo, wi)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // BXDF and scattering event ( scatteringevent.cpp )
 // ---------------------------------------------------------------------------------------------
 
@@ -697,6 +1010,9 @@ pub enum Bxdf {
     Disney(Disney),
     /// Straight-through transmission with an attenuation, a delta distribution.
     Transparent(Spectrum),
+    Coat(Coat),
+    Fabric(Fabric),
+    DistributionBrdf(DistributionBrdf),
 }
 
 impl Bxdf {
@@ -713,6 +1029,9 @@ impl Bxdf {
             Bxdf::MicrofacetRefraction(m) => m.f(wo, wi),
             Bxdf::Disney(d) => d.f(wo, wi),
             Bxdf::Transparent(_) => Spectrum::ZERO,
+            Bxdf::Coat(c) => c.f(wo, wi),
+            Bxdf::Fabric(c) => c.f(wo, wi),
+            Bxdf::DistributionBrdf(c) => c.f(wo, wi),
         }
     }
 
@@ -724,6 +1043,9 @@ impl Bxdf {
             Bxdf::MicrofacetRefraction(m) => m.pdf(wo, wi),
             Bxdf::Disney(d) => d.pdf(wo, wi),
             Bxdf::Transparent(_) => 0.0,
+            Bxdf::Coat(c) => c.pdf(wo, wi),
+            Bxdf::Fabric(c) => c.pdf(wo, wi),
+            Bxdf::DistributionBrdf(c) => c.pdf(wo, wi),
         }
     }
 
@@ -744,6 +1066,9 @@ impl Bxdf {
             Bxdf::MicrofacetRefraction(m) => m.sample(wo, bs),
             Bxdf::Disney(d) => d.sample(wo, bs, rng),
             Bxdf::Transparent(a) => Some((*a, -wo, 1.0)),
+            Bxdf::Coat(c) => c.sample(wo, bs, rng),
+            Bxdf::Fabric(c) => c.sample(wo, bs, rng),
+            Bxdf::DistributionBrdf(c) => c.sample(wo, bs),
         }
     }
 }
@@ -755,7 +1080,9 @@ struct ScatteringUnit {
     sample_weight: f32,
 }
 
-pub const MAX_BXDF_COUNT: usize = 4;
+/// Partially covering thin glass with a partial coat and a sheen, the largest combination a
+/// `Material` produces, takes all 6.
+pub const MAX_BXDF_COUNT: usize = 6;
 
 /// Result of sampling the BSDF of a scattering event.
 #[derive(Clone, Copy, Debug)]
@@ -800,11 +1127,19 @@ impl ScatteringEvent {
 
     /// Add a BXDF with separate evaluation and sampling weights.
     pub fn add_bxdf(&mut self, bxdf: Bxdf, eval_weight: Spectrum, sample_weight: f32) {
-        if self.count == MAX_BXDF_COUNT || is_black(eval_weight) || sample_weight <= 0.0 {
+        if is_black(eval_weight) || sample_weight <= 0.0 {
+            return;
+        }
+        debug_assert!(self.count < MAX_BXDF_COUNT, "a BXDF does not fit in the scattering event");
+        if self.count == MAX_BXDF_COUNT {
             return;
         }
         self.transmissive |= match &bxdf {
-            Bxdf::Lambert(_) | Bxdf::MicrofacetReflection(_) => false,
+            Bxdf::Lambert(_)
+            | Bxdf::MicrofacetReflection(_)
+            | Bxdf::Coat(_)
+            | Bxdf::Fabric(_)
+            | Bxdf::DistributionBrdf(_) => false,
             Bxdf::LambertTransmission(_) | Bxdf::MicrofacetRefraction(_) | Bxdf::Transparent(_) => true,
             Bxdf::Disney(d) => d.spec_trans > 0.0 || (d.thin_surface && d.diff_trans > 0.0),
         };
@@ -1035,6 +1370,90 @@ mod tests {
         }
         let (importance, uniform) = (importance / n as f32, uniform / n as f32);
         assert!((importance - uniform).abs().max_element() < 0.02, "{importance:?} vs {uniform:?}");
+    }
+
+    fn white_diffuse() -> Disney {
+        Disney { basecolor: Spectrum::ONE, specular: 0.0, roughness: 1.0, ..Default::default() }
+    }
+
+    #[test]
+    fn coat_is_consistent() {
+        let plastic = Disney { basecolor: Spectrum::new(0.8, 0.6, 0.4), roughness: 0.6, ..Default::default() };
+        let cases = [
+            ("clear coat over plastic", Coat::new(plastic, 0.3, 1.5, Spectrum::ZERO)),
+            ("tinted coat over plastic", Coat::new(plastic, 0.5, 1.5, Spectrum::new(0.1, 0.4, 0.9))),
+            ("coat over white diffuse", Coat::new(white_diffuse(), 0.3, 1.5, Spectrum::ZERO)),
+            ("low index coat", Coat::new(white_diffuse(), 0.4, 1.1, Spectrum::ZERO)),
+            ("coat over metal", Coat::new(Disney { metallic: 1.0, roughness: 0.4, ..plastic }, 0.6, 1.6, Spectrum::ZERO)),
+        ];
+        // Closer to the horizon, or with a smoother top, the mirror reflection is a peak too
+        // narrow for the uniform sampling of `check_bxdf` to estimate (this holds for
+        // `MicrofacetReflection` alone).
+        for (name, coat) in cases {
+            for wo in [dir(0.0, 0.0), dir(45.0, 30.0), dir(80.0, 60.0), dir(85.0, 10.0)] {
+                check_bxdf(name, Bxdf::Coat(coat), wo);
+            }
+        }
+    }
+
+    /// A clear coat over a white Lambertian base keeps it white: the coat only moves light
+    /// from the base to its own reflection.
+    #[test]
+    fn clear_coat_keeps_a_white_base_white() {
+        let coat = Bxdf::Coat(Coat::new(white_diffuse(), 0.3, 1.5, Spectrum::ZERO));
+        let mut rng = Rng::new(3, 9);
+        for theta in [0.0, 30.0, 60.0] {
+            let wo = dir(theta, 20.0);
+            let n = 200_000;
+            let mut albedo = Spectrum::ZERO;
+            for _ in 0..n {
+                let bs = rng.pair();
+                if let Some((f, _, pdf)) = coat.sample(wo, bs, &mut rng) {
+                    albedo += f / pdf;
+                }
+            }
+            let albedo = albedo.x / n as f32;
+            assert!(albedo > 0.95 && albedo < 1.02, "{theta} degrees: {albedo}");
+        }
+    }
+
+    #[test]
+    fn fabric_is_consistent() {
+        for r in [0.0, 0.4, 0.8, 1.0] {
+            let bxdf = Bxdf::Fabric(Fabric { base_color: Spectrum::new(0.9, 0.7, 0.5), roughness: r });
+            for wo in [dir(0.0, 0.0), dir(40.0, 20.0), dir(70.0, 90.0), dir(88.0, 0.0)] {
+                check_bxdf("fabric", bxdf, wo);
+            }
+        }
+    }
+
+    /// The normalization makes a white fabric reflect all the light at normal incidence.
+    #[test]
+    fn white_fabric_has_unit_albedo_at_normal_incidence() {
+        let mut rng = Rng::new(5, 1);
+        for r in [0.0, 0.5, 1.0] {
+            let bxdf = Bxdf::Fabric(Fabric { base_color: Spectrum::ONE, roughness: r });
+            let n = 400_000;
+            let mut albedo = 0.0;
+            for _ in 0..n {
+                let (u, v) = rng.pair();
+                let wi = uniform_sample_sphere(u, v);
+                albedo += bxdf.f(Vec3::Y, wi).x / uniform_sphere_pdf();
+            }
+            let albedo = albedo / n as f32;
+            assert!((albedo - 1.0).abs() < 0.02, "roughness {r}: {albedo}");
+        }
+    }
+
+    #[test]
+    fn distribution_brdf_is_consistent() {
+        let base = Spectrum::new(0.7, 0.5, 0.9);
+        for (r, specular, specular_tint) in [(0.0, 0.0, 0.0), (0.5, 0.5, 0.3), (0.8, 1.0, 1.0), (1.0, 0.3, 0.0)] {
+            let bxdf = Bxdf::DistributionBrdf(DistributionBrdf { base_color: base, roughness: r, specular, specular_tint });
+            for wo in [dir(0.0, 0.0), dir(50.0, 20.0), dir(89.0, 45.0)] {
+                check_bxdf("distribution brdf", bxdf, wo);
+            }
+        }
     }
 
     #[test]

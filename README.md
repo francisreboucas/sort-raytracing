@@ -35,11 +35,18 @@ cargo run --release -- house.glb -o house.png -w 1920 --spp 512 --depth 8
 cargo run --release -- house.glb --env sky.hdr --env-rotate 90      # lit by an HDR environment
 cargo run --release -- house.glb --sun 135,40 --sky 1.2,1.6,2.2     # a sun (azimuth, elevation) and a plain sky
 cargo run --release -- house.glb -o house.exr             # linear radiance
+cargo run --release -- house.glb --projection ortho --ortho-height 8   # orthographic view 8 m high
+cargo run --release -- house.glb --projection panorama -w 4096         # 360 degree panorama, 4096x2048
+cargo run --release -- house.glb --integrator ao --ao-distance 2       # white clay render, ambient occlusion
 cargo run --release -- --help
 ```
 
 Scenes are glTF 2.0 (`.gltf` or `.glb`): meshes, metallic-roughness materials with their
-textures, cameras and the lights of `KHR_lights_punctual`. Lengths are in meters and Y is up.
+textures, alpha modes (mask and blend), `KHR_texture_transform`, clearcoat
+(`KHR_materials_clearcoat`) and sheen (`KHR_materials_sheen`), cameras and the lights of
+`KHR_lights_punctual`. Lengths are in meters and Y is up. A file that lists clearcoat or sheen
+in `extensionsRequired` (not only in `extensionsUsed`) is refused by the `gltf` crate, which
+only accepts the required extensions it has types for.
 `.png` and `.jpg` images are tone mapped (ACES by default) and sRGB encoded; `.exr` and `.hdr`
 hold linear radiance.
 
@@ -73,6 +80,12 @@ save_image(Path::new("room.png"), &pixels, camera.width, camera.height, 1.0, Ton
 ![A room lit through a doorway](assets/readme/library.png)
 
 `cargo run --release --example library` renders this image.
+
+[`examples/materials.rs`](examples/materials.rs) shows the coat, the sheen and the two cloths
+(`Material::coat`, `sheen_color`, `cloth`) on a row of spheres over a varnished floor:
+`cargo run --release --example materials`. A material can also have a different material on
+its back face, `Material::back_material`, for sheets with two finishes; glTF has no way of
+saying that.
 
 The image at the top comes from [`examples/furnished.rs`](examples/furnished.rs), which loads a
 glTF file into a `SceneBuilder` and adds the room, the window and the lights around it:
@@ -125,10 +138,14 @@ measurement are in `examples/`: `compare` (error against a reference image) and 
 | SORT (C++) | SORT-rs | Notes |
 |---|---|---|
 | `integrator/pathtracing`, `integratormethod` | `integrator.rs` | Path tracing, light sampling with multiple importance sampling, Russian roulette; see above |
+| `integrator/ao` | `integrator.rs` | Ambient occlusion for white "clay" renders; thin glass attenuates instead of blocking |
 | `accel/bvh`, `bvh_utils` | `bvh.rs` | SAH with 16 bins; the tree is a flat array, traversed without recursion |
 | `shape/triangle` | `scene.rs` | Watertight intersection |
-| `camera/perspective` | `camera.rs` | With depth of field |
+| `camera/perspective`, `orthogonal`, `environment` | `camera.rs` | Perspective with depth of field, orthographic, 360 degree latitude-longitude panorama |
 | `bsdf/disney`, `microfacet`, `fresnel`, `lambert`, `transparent` | `bsdf.rs` | The Disney BRDF without sub-surface scattering; anisotropic GGX |
+| `bsdf/coat` | `bsdf.rs`, `material.rs` | A varnish or lacquer layer; the base under it is the Disney BRDF. `Material::coat`, glTF clearcoat |
+| `bsdf/fabric`, `distributionbrdf` | `bsdf.rs`, `material.rs` | The DreamWorks fabric and the distribution-based cloth of The Order: 1886, as `Material::cloth`; the second is also the glTF sheen |
+| `bsdf/doublesided` | `scene.rs`, `material.rs` | A back material, `Material::back_material`, shades the back face |
 | `scatteringevent` | `bsdf.rs` | A mix of BXDFs with evaluation and sampling weights |
 | `light/distant`, `pointlight`, `spot`, `skylight`, `hdrskylight`, `area` | `light.rs` | An area light is a set of emissive triangles |
 | `material` and the Tiny Shading Language | `material.rs` | No shading language: a fixed set of parameters becomes the closures |
@@ -139,26 +156,36 @@ measurement are in `examples/`: `compare` (error against a reference image) and 
 - **Thin glass** (transmission with no `KHR_materials_volume`): light goes straight through, the
   pane reflects as a dielectric, and shadow rays cross it attenuated. That is what lets the sun
   into a room through a window.
+- **Alpha.** A masked material (leaves, fences, perforated screens) is a hole in the geometry
+  where its alpha is below the cutoff: rays of every kind go through. A blended one (sheer
+  curtains) is partial coverage: the surface is there with a probability equal to its alpha,
+  light goes straight through the rest, and shadow rays cross it attenuated by that fraction.
 - Shadow rays start 0.1 mm from the surface, not 1 cm: at 1 cm, light leaks along every corner
   of a room modelled in meters.
 - The BVH may be 48 levels deep, not 16, for scenes of millions of triangles.
 - Consistency fixes: rough refraction is zero for directions its own sampling cannot produce,
   the pdf of the diffuse lobe of the Disney BRDF covers one hemisphere only, and the mix of
   BXDFs is evaluated in one frame. They are commented in the code.
+- **Coat and fabric.** The light the top of the layer reflects back down is returned to the base, which
+  keeps a white base under a clear coat white (SORT loses about 30% of it), and the base is
+  weighted with the cosine outside the layer, not inside. The color of the coat is the
+  transmittance of a straight trip down and up, not the curve SORT's Blender node uses. The
+  fabric is normalized with the exact albedo of its lobe; SORT's table makes it 7 to 21% darker.
 
 ## Not ported yet
 
-Participating media, sub-surface scattering, hair and fur, fabric, the MERL and Fourier BRDFs,
-coat and double-sided closures, the other integrators (bidirectional, light tracing, instant
-radiosity, ambient occlusion, Whitted), the other accelerators (QBVH, OBVH, k-d tree, octree,
-uniform grid), SIMD, and the orthographic and environment cameras. On the glTF side: alpha
-cutouts, `KHR_texture_transform` and clearcoat.
+Participating media, sub-surface scattering, hair and fur, the MERL and Fourier BRDFs, the
+other integrators (bidirectional, light tracing, instant radiosity, Whitted), the other
+accelerators (QBVH, OBVH, k-d tree, octree, uniform grid) and SIMD. A coat over anything but
+the Disney BRDF. On the glTF side: texture coordinate sets other than `TEXCOORD_0`, the normal
+map of the clearcoat, and `KHR_texture_transform` on normal textures (the `gltf` crate does not
+expose it there, so a transformed normal map is applied with the mesh UVs as they are).
 
 ## Tests
 
-`cargo test` runs 18 tests: importance sampling against value and pdf for every BXDF, the BVH
-against a brute force loop, the camera, the environment map, the glTF loader, and renders
-compared with analytic results.
+`cargo test` runs 41 tests: importance sampling against value and pdf for every BXDF, the BVH
+against a brute force loop, the camera, the environment map, the glTF loader, materials and
+their textures, and renders compared with analytic results.
 
 ## Models
 
