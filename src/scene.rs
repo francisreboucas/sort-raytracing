@@ -200,6 +200,9 @@ impl SceneBuilder {
         for m in self.tri_material.iter_mut() {
             *m = (*m).min(last_material);
         }
+        for m in self.materials.iter_mut() {
+            m.back_material = m.back_material.filter(|&b| b <= last_material);
+        }
 
         let bboxes: Vec<BBox> = self
             .tris
@@ -215,7 +218,8 @@ impl SceneBuilder {
         let bvh = Bvh::build(&bboxes);
         let bbox = bvh.bbox();
 
-        let has_transparency = self.materials.iter().any(|m| m.thin && m.transmission > 0.0);
+        let has_transparency = self.materials.iter().any(Material::lets_shadows_through);
+        let has_cutouts = self.materials.iter().any(Material::has_cutouts);
         let mut scene = Scene {
             positions: self.positions,
             normals: self.normals,
@@ -237,6 +241,7 @@ impl SceneBuilder {
             bvh,
             bbox,
             has_transparency,
+            has_cutouts,
         };
 
         // every emissive triangle is an area light
@@ -390,7 +395,11 @@ pub struct Scene {
     world_radius: f32,
     bvh: Bvh,
     pub bbox: BBox,
+    /// Some material lets shadow rays through, see `Material::lets_shadows_through`.
     has_transparency: bool,
+    /// Some material has holes, see `Material::has_cutouts`. Without them traversal never
+    /// looks at materials.
+    has_cutouts: bool,
 }
 
 /// Watertight ray-triangle intersection, ported from `Triangle::GetIntersect`.
@@ -478,12 +487,26 @@ impl Scene {
         intersect_triangle(ray, p0, p1, p2, tmax)
     }
 
+    /// `intersect_triangle` that also goes through the holes of masked materials (alpha
+    /// cutouts): leaves, fences, perforated screens are flat faces with holes in the texture.
+    #[inline]
+    fn hit_triangle(&self, tri: u32, ray: &Ray, tmax: f32) -> Option<(f32, f32, f32)> {
+        let (t, b1, b2) = self.intersect_triangle(tri, ray, tmax)?;
+        if self.has_cutouts {
+            let material = self.triangle_material(tri);
+            if material.has_cutouts() && material.opacity_at(self.triangle_uv(tri, b1, b2)) <= 0.0 {
+                return None;
+            }
+        }
+        Some((t, b1, b2))
+    }
+
     /// Nearest intersection as a triangle index, distance and barycentric weights.
     #[inline]
     fn nearest(&self, ray: &Ray) -> Option<(u32, f32, f32, f32)> {
         let mut best = None;
         self.bvh.intersect(ray, |tri, tmax| {
-            let (t, b1, b2) = self.intersect_triangle(tri, ray, tmax)?;
+            let (t, b1, b2) = self.hit_triangle(tri, ray, tmax)?;
             best = Some((tri, t, b1, b2));
             Some(t)
         });
@@ -520,13 +543,14 @@ impl Scene {
         })
     }
 
-    /// Whether anything blocks the ray, ignoring transparency.
+    /// Whether anything blocks the ray, ignoring transparency (but not the holes of cutouts).
     pub fn is_occluded(&self, ray: &Ray) -> bool {
-        self.bvh.occluded(ray, |tri| self.intersect_triangle(tri, ray, ray.tmax).is_some())
+        self.bvh.occluded(ray, |tri| self.hit_triangle(tri, ray, ray.tmax).is_some())
     }
 
-    /// Fraction of light that travels along a shadow ray. Thin transmissive surfaces attenuate
-    /// the light instead of blocking it (`Visibility::GetAttenuation` with transparent shadows).
+    /// Fraction of light that travels along a shadow ray. Thin transmissive surfaces and
+    /// partially covering ones attenuate the light instead of blocking it
+    /// (`Visibility::GetAttenuation` with transparent shadows).
     pub fn transmittance(&self, ray: &Ray) -> Spectrum {
         if !self.has_transparency {
             return if self.is_occluded(ray) { Spectrum::ZERO } else { Spectrum::ONE };
@@ -610,8 +634,10 @@ impl Scene {
         self.portals.is_some() && !self.suns.is_empty()
     }
 
-    /// First opaque surface along a ray, with the attenuation of the thin glass crossed
-    /// before reaching it.
+    /// First opaque surface along a ray, with the attenuation of the thin glass and partially
+    /// covering surfaces crossed before reaching it. Sun points never land on those: they
+    /// let the sun through on the way to the points behind them, and the sun light they
+    /// reflect themselves is left to the paths (see `sun_point_density`).
     fn first_opaque_hit(&self, ray: &Ray) -> Option<(Hit, Spectrum)> {
         let mut attenuation = Spectrum::ONE;
         let mut ray = *ray;
@@ -652,14 +678,21 @@ impl Scene {
         density
     }
 
-    /// Density w.r.t. surface area with which `sample_sun_point` generates point `y` lit by
-    /// distant light `light`. Zero when the light is not a sun or no portal lines up with it.
-    pub fn sun_point_density(&self, light: u32, y: Vec3, ng: Vec3) -> f32 {
+    /// Density w.r.t. surface area with which `sample_sun_point` generates the point of `hit`
+    /// lit by distant light `light`. Zero when the light is not a sun, no portal lines up with
+    /// it, or the point lets shadow rays through (thin glass, partial coverage), which sun
+    /// points cross instead of landing on.
+    pub fn sun_point_density(&self, light: u32, hit: &Hit) -> f32 {
         let pick = self.sun_pick[light as usize];
-        match &self.lights[light as usize] {
-            Light::Distant { dir, .. } if pick > 0.0 => pick * self.portal_line_density(y, ng, *dir),
-            _ => 0.0,
+        let Light::Distant { dir, .. } = &self.lights[light as usize] else {
+            return 0.0;
+        };
+        if pick <= 0.0
+            || (self.has_transparency && self.materials[hit.material as usize].shadow_transmittance(hit.uv).is_some())
+        {
+            return 0.0;
         }
+        pick * self.portal_line_density(hit.p, hit.ng, *dir)
     }
 
     /// Sample a surface point lit by a sun through a portal: pick a sun and a point of the
@@ -684,7 +717,7 @@ impl Scene {
         // start outside of the scene, something may shade the portal
         let back = 2.0 * self.world_radius + (q - self.bbox.center()).length();
         let (hit, attenuation) = self.first_opaque_hit(&Ray::new(q - *dir * back, *dir, 0.0, f32::MAX))?;
-        let density = self.sun_point_density(light, hit.p, hit.ng);
+        let density = self.sun_point_density(light, &hit);
         (density > 0.0).then(|| SunPoint { hit, dir: *dir, irradiance: *intensity * attenuation, density })
     }
 
@@ -738,7 +771,9 @@ impl Scene {
         }
     }
 
-    /// Radiance emitted by the surface at a hit towards `wo`.
+    /// Radiance emitted by the surface at a hit towards `wo`. It always comes from the front
+    /// material, even on a back face with a `back_material`, which is what area light sampling
+    /// assumes.
     pub fn emission(&self, hit: &Hit, wo: Vec3) -> Spectrum {
         let material = &self.materials[hit.material as usize];
         if !material.is_emissive() || (!material.double_sided && hit.ng.dot(wo) <= 0.0) {
@@ -750,12 +785,16 @@ impl Scene {
     /// Build the scattering event at a hit: shading frame, normal mapping and the BXDFs.
     /// `min_alpha` widens the specular lobes, see `Material::update_scattering_event`.
     pub fn scattering_event(&self, hit: &Hit, wo: Vec3, min_alpha: f32) -> ScatteringEvent {
-        let material = &self.materials[hit.material as usize];
+        let mut material = &self.materials[hit.material as usize];
 
-        // Surfaces without an interior are shaded on both sides.
+        // Surfaces without an interior are shaded on both sides, the back with the back
+        // material if there is one (SORT's double-sided closure).
         let mut n = hit.n;
         if !material.has_interior() && hit.ng.dot(wo) < 0.0 {
             n = -n;
+            if let Some(back) = material.back_material {
+                material = &self.materials[back as usize];
+            }
         }
 
         let mut tangent = hit.tangent;

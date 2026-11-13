@@ -35,11 +35,18 @@ cargo run --release -- casa.glb -o casa.png -w 1920 --spp 512 --depth 8
 cargo run --release -- casa.glb --env ceu.hdr --env-rotate 90       # iluminada por um ambiente HDR
 cargo run --release -- casa.glb --sun 135,40 --sky 1.2,1.6,2.2      # um sol (azimute, elevação) e um céu liso
 cargo run --release -- casa.glb -o casa.exr               # radiância linear
+cargo run --release -- casa.glb --projection ortho --ortho-height 8    # vista ortográfica de 8 m de altura
+cargo run --release -- casa.glb --projection panorama -w 4096          # panorama de 360 graus, 4096x2048
+cargo run --release -- casa.glb --integrator ao --ao-distance 2        # render branco de maquete, ambient occlusion
 cargo run --release -- --help
 ```
 
 As cenas são glTF 2.0 (`.gltf` ou `.glb`): malhas, materiais metallic-roughness com suas
-texturas, câmeras e as luzes de `KHR_lights_punctual`. Comprimentos em metros, Y para cima.
+texturas, modos de alpha (mask e blend), `KHR_texture_transform`, clearcoat
+(`KHR_materials_clearcoat`) e sheen (`KHR_materials_sheen`), câmeras e as luzes de
+`KHR_lights_punctual`. Comprimentos em metros, Y para cima. Um arquivo que lista clearcoat ou
+sheen em `extensionsRequired` (e não só em `extensionsUsed`) é recusado pelo crate `gltf`, que só
+aceita as extensões obrigatórias para as quais tem tipos.
 Imagens `.png` e `.jpg` recebem tone mapping (ACES por padrão) e sRGB; `.exr` e `.hdr` guardam
 radiância linear.
 
@@ -73,6 +80,12 @@ save_image(Path::new("room.png"), &pixels, camera.width, camera.height, 1.0, Ton
 ![Uma sala iluminada por um vão de porta](assets/readme/library.png)
 
 `cargo run --release --example library` gera esta imagem.
+
+[`examples/materials.rs`](examples/materials.rs) mostra o coat, o sheen e os dois tecidos
+(`Material::coat`, `sheen_color`, `cloth`) em uma fileira de esferas sobre um piso envernizado:
+`cargo run --release --example materials`. Um material também pode ter outro material na face
+de trás, `Material::back_material`, para lâminas com dois acabamentos; o glTF não tem como
+dizer isso.
 
 A imagem do topo vem de [`examples/furnished.rs`](examples/furnished.rs), que carrega um arquivo
 glTF em um `SceneBuilder` e acrescenta a sala, a janela e as luzes em volta dele:
@@ -125,10 +138,14 @@ referência) e `variance` (variância de cada pixel, um tipo de luz por vez).
 | SORT (C++) | SORT-rs | Observações |
 |---|---|---|
 | `integrator/pathtracing`, `integratormethod` | `integrator.rs` | Path tracing, amostragem de luz com multiple importance sampling, roleta russa; veja acima |
+| `integrator/ao` | `integrator.rs` | Ambient occlusion para renders brancos de "maquete"; vidro fino atenua em vez de bloquear |
 | `accel/bvh`, `bvh_utils` | `bvh.rs` | SAH com 16 bins; a árvore é um array, percorrido sem recursão |
 | `shape/triangle` | `scene.rs` | Interseção watertight |
-| `camera/perspective` | `camera.rs` | Com profundidade de campo |
+| `camera/perspective`, `orthogonal`, `environment` | `camera.rs` | Perspectiva com profundidade de campo, ortográfica, panorama de 360 graus em latitude-longitude |
 | `bsdf/disney`, `microfacet`, `fresnel`, `lambert`, `transparent` | `bsdf.rs` | O Disney BRDF sem sub-surface scattering; GGX anisotrópico |
+| `bsdf/coat` | `bsdf.rs`, `material.rs` | Uma camada de verniz ou laca; a base sob ela é o Disney BRDF. `Material::coat`, clearcoat do glTF |
+| `bsdf/fabric`, `distributionbrdf` | `bsdf.rs`, `material.rs` | O tecido da DreamWorks e o tecido baseado em distribuição de The Order: 1886, como `Material::cloth`; o segundo também é o sheen do glTF |
+| `bsdf/doublesided` | `scene.rs`, `material.rs` | Um material de trás, `Material::back_material`, sombreia a face de trás |
 | `scatteringevent` | `bsdf.rs` | Uma mistura de BXDFs com pesos de avaliação e de amostragem |
 | `light/distant`, `pointlight`, `spot`, `skylight`, `hdrskylight`, `area` | `light.rs` | Uma luz de área é um conjunto de triângulos emissivos |
 | `material` e a Tiny Shading Language | `material.rs` | Sem linguagem de shading: um conjunto fixo de parâmetros vira as closures |
@@ -139,26 +156,37 @@ referência) e `variance` (variância de cada pixel, um tipo de luz por vez).
 - **Vidro fino** (transmissão sem `KHR_materials_volume`): a luz atravessa em linha reta, a
   lâmina reflete como um dielétrico e os raios de sombra a cruzam atenuados. É o que deixa o sol
   entrar em uma sala por uma janela.
+- **Alpha.** Um material com máscara (folhas, cercas, chapas perfuradas) é um furo na geometria
+  onde o alpha fica abaixo do corte: raios de todo tipo passam. Um material com blend (cortinas
+  translúcidas) é cobertura parcial: a superfície está lá com probabilidade igual ao alpha, a luz
+  atravessa o resto em linha reta e os raios de sombra a cruzam atenuados nessa fração.
 - Os raios de sombra partem a 0,1 mm da superfície, não a 1 cm: com 1 cm, a luz vaza em todos os
   cantos de um ambiente modelado em metros.
 - A BVH pode ter 48 níveis, não 16, para cenas com milhões de triângulos.
 - Correções de consistência: a refração rugosa é zero nas direções que a própria amostragem não
   produz, o pdf do lobo difuso do Disney BRDF cobre só um hemisfério, e a mistura de BXDFs é
   avaliada em um único referencial. Estão comentadas no código.
+- **Coat e tecido.** A luz que o topo da camada reflete de volta para baixo é devolvida à base,
+  o que mantém branca uma base branca sob um coat transparente (o SORT perde cerca de 30% dela),
+  e a base é ponderada pelo cosseno de fora da camada, não de dentro. A cor do coat é a
+  transmitância de uma ida e volta em linha reta, não a curva que o nó do Blender do SORT usa. O
+  tecido é normalizado com o albedo exato do seu lobo; a tabela do SORT o deixa de 7 a 21% mais
+  escuro.
 
 ## Ainda não portado
 
-Meios participantes, sub-surface scattering, cabelo e pelo, tecido, os BRDFs MERL e Fourier, as
-closures coat e double-sided, os outros integradores (bidirecional, light tracing, instant
-radiosity, ambient occlusion, Whitted), os outros aceleradores (QBVH, OBVH, k-d tree, octree,
-grade uniforme), SIMD e as câmeras ortográfica e de ambiente. Do lado do glTF: recorte por
-alpha, `KHR_texture_transform` e clearcoat.
+Meios participantes, sub-surface scattering, cabelo e pelo, os BRDFs MERL e Fourier, os outros
+integradores (bidirecional, light tracing, instant radiosity, Whitted), os outros aceleradores
+(QBVH, OBVH, k-d tree, octree, grade uniforme) e SIMD. Um coat sobre outra coisa que não o
+Disney BRDF. Do lado do glTF: conjuntos de coordenadas de textura além de `TEXCOORD_0`, o normal
+map do clearcoat e `KHR_texture_transform` em texturas de normal (o crate `gltf` não o expõe
+ali, então um normal map transformado é aplicado com as UVs da malha como estão).
 
 ## Testes
 
-`cargo test` roda 18 testes: amostragem por importância contra valor e pdf de cada BXDF, a BVH
-contra um laço de força bruta, a câmera, o mapa de ambiente, o loader de glTF e renders
-comparados com resultados analíticos.
+`cargo test` roda 41 testes: amostragem por importância contra valor e pdf de cada BXDF, a BVH
+contra um laço de força bruta, a câmera, o mapa de ambiente, o loader de glTF, materiais e suas
+texturas e renders comparados com resultados analíticos.
 
 ## Modelos
 

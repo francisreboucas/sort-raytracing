@@ -33,6 +33,12 @@
 //!   a rough surface, the surfaces it meets next are made at least as blurry as that bounce
 //!   was (`filter_glossy`): the caustic is blurred instead of scattered as fireflies. This
 //!   is the one change that is not exact, and it can be turned off.
+//!
+//! `AmbientOcclusion`, ported from `src/integrator/ao.cpp`, renders the "clay" view
+//! architects use: no materials and no lights, every surface white and darkened by the
+//! geometry around it within a given distance. Unlike SORT, thin glass attenuates instead of
+//! blocking, both for the camera and for the occlusion rays, so a glazed room is not black;
+//! alpha blended surfaces let through the part of the rays they do not cover.
 
 use crate::bsdf::ScatteringEvent;
 use crate::light::Light;
@@ -134,7 +140,7 @@ fn sun_weight(scene: &Scene, light: u32, hit: &Hit, scatter: Scatter) -> f32 {
     let Some((prev, pdf)) = scatter else {
         return 1.0;
     };
-    let connection = scene.sun_point_density(light, hit.p, hit.ng);
+    let connection = scene.sun_point_density(light, hit);
     if connection <= 0.0 {
         return 1.0;
     }
@@ -394,5 +400,60 @@ impl PathTracing {
         }
 
         l
+    }
+}
+
+/// Ambient occlusion (`src/integrator/ao.cpp`): white, times the fraction of the hemisphere
+/// around the first surface seen that is open within `max_distance`, cosine weighted.
+pub struct AmbientOcclusion {
+    /// Geometry farther than this from a point does not darken it, in scene units.
+    pub max_distance: f32,
+}
+
+impl AmbientOcclusion {
+    /// Thin transmissive surfaces the camera ray may cross before finding an opaque one.
+    const MAX_CROSSINGS: u32 = 32;
+
+    /// Occlusion seen along a camera ray, 1 where the ray leaves the scene.
+    pub fn li(&self, ray: &Ray, scene: &Scene, rng: &mut Rng) -> Spectrum {
+        // Like `Scene::first_opaque_hit`, but a ray that leaves the scene through glass keeps
+        // the attenuation of that glass instead of being lost.
+        let mut attenuation = Spectrum::ONE;
+        let mut r = *ray;
+        let mut crossings = 0;
+        let hit = loop {
+            let Some(hit) = scene.intersect(&r) else {
+                return attenuation;
+            };
+            // A partially covering surface is there with probability its coverage: either it
+            // is shaded like any other or the ray goes on unchanged.
+            let material = &scene.materials[hit.material as usize];
+            let coverage = material.coverage(hit.uv);
+            if coverage >= 1.0 || rng.f32() < coverage {
+                match material.glass_transmittance(hit.uv) {
+                    None => break hit,
+                    Some(tr) => attenuation *= tr,
+                }
+            }
+            crossings += 1;
+            if is_black(attenuation) || crossings >= Self::MAX_CROSSINGS {
+                return Spectrum::ZERO;
+            }
+            r.tmin = hit.t + hit.t.abs() * 1e-5 + 1e-5;
+        };
+
+        // shading normal on the side the ray came from; normal maps are left out, a clay
+        // render shows the geometry
+        let n = if hit.ng.dot(r.dir) > 0.0 { -hit.n } else { hit.n };
+        let (u, v) = rng.pair();
+        let local = cos_sample_hemisphere(u, v);
+        if local.y <= 0.0 {
+            return Spectrum::ZERO;
+        }
+        let (s, t) = coordinate_system(n);
+        let wi = s * local.x + n * local.y + t * local.z;
+
+        // the cosine and the pdf of the cosine weighted sample cancel out
+        attenuation * scene.transmittance(&Ray::new(hit.p, wi, RAY_EPSILON, self.max_distance))
     }
 }
