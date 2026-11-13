@@ -96,6 +96,17 @@ impl SceneBuilder {
         self.tris.len()
     }
 
+    /// Bounding box of the geometry added so far.
+    pub fn bounds(&self) -> BBox {
+        let mut bbox = BBox::default();
+        for t in &self.tris {
+            for &i in t {
+                bbox.union_point(self.positions[i as usize]);
+            }
+        }
+        bbox
+    }
+
     /// Add a triangle mesh in world space. Missing normals and tangents are generated.
     pub fn add_mesh(
         &mut self,

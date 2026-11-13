@@ -9,15 +9,21 @@ the lighting reworked for interiors.
 
 [Português (Brasil)](README.pt-BR.md)
 
-![A room lit by the sun and the sky through a glazed window](assets/readme/interior.png)
+![A sideboard, a chair, a plant and a floor lamp in a room lit by the sun through a window](assets/readme/furnished.png)
 
-The built-in interior (`sort --demo`), 960x540 at 320 samples per pixel: sun and sky through a
-glazed window, a ceiling lamp, a coated table top and steel legs.
+A glTF model placed in a room with a glazed window, lit by the sun and the sky; 300 samples per
+pixel. Furniture by Korusss ([credits](#models)).
+
+| | |
+|---|---|
+| ![A sofa in front of a bookcase with lit shelves](assets/readme/living-room.png) | ![A potted monstera casting the shadow of its leaves on a wall](assets/readme/monstera.png) |
+| Sofa and bookcase by uniboxtrade: 124 thousand triangles, the strips of light in the shelves are emissive surfaces | Monstera by Giora |
 
 ## Status
 
-Early. The renderer is tested against analytic results and on its built-in scenes; it has not
-been run on a large architectural model yet. See [what is not ported](#not-ported-yet).
+Early. The renderer is tested against analytic results, on its built-in scenes and on the glTF
+models shown here (up to 124 thousand triangles); it has not been run on a whole building yet.
+See [what is not ported](#not-ported-yet).
 
 ## Running it
 
@@ -36,6 +42,10 @@ Scenes are glTF 2.0 (`.gltf` or `.glb`): meshes, metallic-roughness materials wi
 textures, cameras and the lights of `KHR_lights_punctual`. Lengths are in meters and Y is up.
 `.png` and `.jpg` images are tone mapped (ACES by default) and sRGB encoded; `.exr` and `.hdr`
 hold linear radiance.
+
+![A room with a table, lit by the sun and the sky through a glazed window](assets/readme/interior.png)
+
+The built-in interior, `--demo`, at 320 samples per pixel.
 
 ## As a library
 
@@ -63,6 +73,18 @@ save_image(Path::new("room.png"), &pixels, camera.width, camera.height, 1.0, Ton
 ![A room lit through a doorway](assets/readme/library.png)
 
 `cargo run --release --example library` renders this image.
+
+The image at the top comes from [`examples/furnished.rs`](examples/furnished.rs), which loads a
+glTF file into a `SceneBuilder` and adds the room, the window and the lights around it:
+
+```sh
+cargo run --release --example furnished -- assets/models/furniture_set.glb furnished.png 300 1.7 -x
+cargo run --release --example furnished -- assets/models/p0140_04.glb living-room.png 300 2.4
+cargo run --release --example furnished -- assets/models/monstera_deliciosa.glb monstera.png 300 1.3
+```
+
+The numbers are the samples per pixel and the height of the model in meters; `-x` puts the camera
+on the other side of the model.
 
 ## Lighting an interior
 
@@ -137,6 +159,17 @@ cutouts, `KHR_texture_transform` and clearcoat.
 `cargo test` runs 18 tests: importance sampling against value and pdf for every BXDF, the BVH
 against a brute force loop, the camera, the environment map, the glTF loader, and renders
 compared with analytic results.
+
+## Models
+
+The models in the images are in [`assets/models`](assets/models). They are not part of SORT-rs
+and keep their own licenses:
+
+| Model | Author | License | File |
+|---|---|---|---|
+| Furniture set | Korusss | Creative Commons Attribution | `furniture_set.glb` |
+| Sofa and bookcase | uniboxtrade | Creative Commons | `p0140_04.glb` |
+| Monstera deliciosa | Giora | Creative Commons | `monstera_deliciosa.glb` |
 
 ## License
 

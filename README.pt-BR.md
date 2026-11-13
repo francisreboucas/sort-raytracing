@@ -9,15 +9,21 @@ iluminação refeita para interiores.
 
 [English](README.md)
 
-![Uma sala iluminada pelo sol e pelo céu através de uma janela envidraçada](assets/readme/interior.png)
+![Um aparador, uma cadeira, uma planta e uma luminária de piso em uma sala iluminada pelo sol através de uma janela](assets/readme/furnished.png)
 
-O interior embutido (`sort --demo`), 960x540 com 320 amostras por pixel: sol e céu através de uma
-janela envidraçada, uma luminária de teto, um tampo envernizado e pés de aço.
+Um modelo glTF colocado em uma sala com janela envidraçada, iluminado pelo sol e pelo céu; 300
+amostras por pixel. Móveis de Korusss ([créditos](#modelos)).
+
+| | |
+|---|---|
+| ![Um sofá diante de uma estante com prateleiras iluminadas](assets/readme/living-room.png) | ![Uma monstera em vaso projetando a sombra das folhas em uma parede](assets/readme/monstera.png) |
+| Sofá e estante de uniboxtrade: 124 mil triângulos, as fitas de luz nas prateleiras são superfícies emissivas | Monstera de Giora |
 
 ## Estado
 
-Inicial. O renderizador é testado contra resultados analíticos e nas suas cenas embutidas; ainda
-não foi usado em um modelo arquitetônico grande. Veja [o que não foi portado](#ainda-não-portado).
+Inicial. O renderizador é testado contra resultados analíticos, nas suas cenas embutidas e nos
+modelos glTF mostrados aqui (até 124 mil triângulos); ainda não foi usado em um edifício inteiro.
+Veja [o que não foi portado](#ainda-não-portado).
 
 ## Como rodar
 
@@ -36,6 +42,10 @@ As cenas são glTF 2.0 (`.gltf` ou `.glb`): malhas, materiais metallic-roughness
 texturas, câmeras e as luzes de `KHR_lights_punctual`. Comprimentos em metros, Y para cima.
 Imagens `.png` e `.jpg` recebem tone mapping (ACES por padrão) e sRGB; `.exr` e `.hdr` guardam
 radiância linear.
+
+![Uma sala com uma mesa, iluminada pelo sol e pelo céu através de uma janela envidraçada](assets/readme/interior.png)
+
+O interior embutido, `--demo`, com 320 amostras por pixel.
 
 ## Como biblioteca
 
@@ -63,6 +73,18 @@ save_image(Path::new("room.png"), &pixels, camera.width, camera.height, 1.0, Ton
 ![Uma sala iluminada por um vão de porta](assets/readme/library.png)
 
 `cargo run --release --example library` gera esta imagem.
+
+A imagem do topo vem de [`examples/furnished.rs`](examples/furnished.rs), que carrega um arquivo
+glTF em um `SceneBuilder` e acrescenta a sala, a janela e as luzes em volta dele:
+
+```sh
+cargo run --release --example furnished -- assets/models/furniture_set.glb furnished.png 300 1.7 -x
+cargo run --release --example furnished -- assets/models/p0140_04.glb living-room.png 300 2.4
+cargo run --release --example furnished -- assets/models/monstera_deliciosa.glb monstera.png 300 1.3
+```
+
+Os números são as amostras por pixel e a altura do modelo em metros; `-x` põe a câmera do outro
+lado do modelo.
 
 ## Iluminação de interiores
 
@@ -137,6 +159,17 @@ alpha, `KHR_texture_transform` e clearcoat.
 `cargo test` roda 18 testes: amostragem por importância contra valor e pdf de cada BXDF, a BVH
 contra um laço de força bruta, a câmera, o mapa de ambiente, o loader de glTF e renders
 comparados com resultados analíticos.
+
+## Modelos
+
+Os modelos das imagens estão em [`assets/models`](assets/models). Eles não fazem parte do
+SORT-rs e mantêm suas próprias licenças:
+
+| Modelo | Autor | Licença | Arquivo |
+|---|---|---|---|
+| Conjunto de móveis | Korusss | Creative Commons Attribution | `furniture_set.glb` |
+| Sofá e estante | uniboxtrade | Creative Commons | `p0140_04.glb` |
+| Monstera deliciosa | Giora | Creative Commons | `monstera_deliciosa.glb` |
 
 ## Licença
 
