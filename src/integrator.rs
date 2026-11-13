@@ -4,7 +4,7 @@
 //! Unidirectional path tracing with next event estimation and multiple importance sampling.
 //!
 //! It started as a port of `src/integrator/pathtracing.cpp` and `integratormethod.cpp`
-//! (without participating media and sub-surface scattering) and departs from them in how
+//! (without sub-surface scattering; participating media are in `medium.rs`) and departs from them in how
 //! lighting is sampled, which is where most of the noise of an interior comes from:
 //!
 //! - SORT picks one light per vertex proportionally to its power. Here the sun, the sky, the
@@ -43,6 +43,7 @@
 use crate::bsdf::ScatteringEvent;
 use crate::light::Light;
 use crate::math::*;
+use crate::medium::{Medium, MediumSample};
 use crate::rng::Rng;
 use crate::scene::{Hit, Scene, SunPoint, LIGHT_CANDIDATES};
 
@@ -183,17 +184,18 @@ fn shade_sample(
     li * f * attenuation * (mis / density)
 }
 
-/// Direct illumination at a surface point from all the lights of the scene. One shadow ray
+/// Direct illumination at a path vertex from all the lights of the scene. One shadow ray
 /// per sun, two for the sky, one for the punctual lights and one for the emissive surfaces.
+/// `hit` is the surface the vertex is on, `None` for a vertex inside a participating medium.
 pub fn evaluate_direct(
     se: &ScatteringEvent,
-    hit: &Hit,
+    p: Vec3,
+    hit: Option<&Hit>,
     wo: Vec3,
     scatter: Scatter,
     scene: &Scene,
     rng: &mut Rng,
 ) -> Spectrum {
-    let p = hit.p;
     let mut radiance = Spectrum::ZERO;
     // one reservoir for the punctual lights, one for the emissive surfaces
     let mut reservoirs = [Reservoir::new(se, wo), Reservoir::new(se, wo)];
@@ -222,7 +224,11 @@ pub fn evaluate_direct(
                 if let Some(ls) = light.sample_l(scene, p, rng.pair()) {
                     let direct = shade_sample(se, p, wo, scene, ls.wi, ls.li, scale * ls.pdf, true, (ls.tmin, ls.tmax));
                     if !is_black(direct) {
-                        let weight = if scene.has_sun_portals() { sun_weight(scene, index, hit, scatter) } else { 1.0 };
+                        // sun points are on surfaces, a vertex inside a medium is not one
+                        let weight = match hit {
+                            Some(hit) if scene.has_sun_portals() => sun_weight(scene, index, hit, scatter),
+                            _ => 1.0,
+                        };
                         radiance += direct * weight;
                     }
                 }
@@ -260,14 +266,14 @@ pub fn evaluate_direct(
 /// is the blur accumulated by the path so far.
 fn connect_sun_point(
     se: &ScatteringEvent,
-    hit: &Hit,
+    p: Vec3,
     wo: Vec3,
     sun: &SunPoint,
     scene: &Scene,
     min_alpha: f32,
     filter_glossy: f32,
 ) -> Spectrum {
-    let d = sun.hit.p - hit.p;
+    let d = sun.hit.p - p;
     let dist2 = d.length_squared();
     if dist2 < 1e-10 {
         return Spectrum::ZERO;
@@ -294,8 +300,30 @@ fn connect_sun_point(
     let path = pdf * cos_at_sun_point / dist2;
     let weight = mis_factor(sun.density, path);
 
-    let attenuation = scene.transmittance(&Ray::new(hit.p, w, RAY_EPSILON, dist - RAY_EPSILON));
+    let attenuation = scene.transmittance(&Ray::new(p, w, RAY_EPSILON, dist - RAY_EPSILON));
     f * reflected * sun.irradiance * attenuation * (weight * cos_at_sun_point / (dist2 * sun.density))
+}
+
+/// The medium a ray travels through up to the surface it hits (or forever), and the range of
+/// the ray that is inside it: the medium of the solid the path is inside of, else the fog.
+fn segment_medium<'a>(
+    scene: &'a Scene,
+    ray: &Ray,
+    hit: Option<&Hit>,
+    inside: Option<u32>,
+) -> Option<(&'a Medium, f32, f32)> {
+    let end = hit.map_or(ray.tmax, |h| h.t);
+    match inside {
+        Some(material) => {
+            let medium = scene.materials[material as usize].medium.as_ref()?;
+            Some((medium, ray.tmin.min(end), end))
+        }
+        None => {
+            let fog = scene.fog.as_ref()?;
+            let (t0, t1) = fog.interval(&Ray::new(ray.ori, ray.dir, ray.tmin, end))?;
+            Some((&fog.medium, t0, t1))
+        }
+    }
 }
 
 impl PathTracing {
@@ -316,51 +344,83 @@ impl PathTracing {
             None
         };
 
+        // the solid transmissive object the path is inside of, as its material
+        let mut inside: Option<u32> = None;
+
         let mut bounces = 0;
         let mut r = *ray;
         loop {
             // get the intersection between the ray and the scene
-            let Some(hit) = scene.intersect(&r) else {
-                let le = scene.le(&r);
-                if !is_black(le) {
-                    let weight = match scatter {
-                        Some((p, pdf)) => mis_factor(pdf, scene.sky_density(p, r.dir)),
-                        None => 1.0,
-                    };
-                    l += throughput * le * weight;
-                }
-                break;
-            };
+            let hit = scene.intersect(&r);
             let wo = -r.dir;
 
-            // emission of the surface the path landed on
-            let le = scene.emission(&hit, wo);
-            if !is_black(le) {
-                let weight = match scatter {
-                    Some((p, pdf)) => mis_factor(pdf, scene.area_light_density(&hit, p, r.dir)),
-                    None => 1.0,
-                };
-                l += throughput * le * weight;
+            // What the ray travels through on its way there may scatter the path before it
+            // arrives, which gives a vertex inside the medium, or only dim it.
+            let mut scattered = None;
+            if let Some((medium, t0, t1)) = segment_medium(scene, &r, hit.as_ref(), inside) {
+                match medium.sample(t1 - t0, rng) {
+                    MediumSample::Through { weight } => throughput *= weight,
+                    MediumSample::Scatter { t, weight } => {
+                        throughput *= weight;
+                        scattered = Some((r.at(t0 + t), medium.phase));
+                    }
+                }
+                if is_black(throughput) {
+                    break;
+                }
             }
 
-            // This introduces bias. 'max_recursive_depth' could be set large to reduce it.
-            if bounces >= self.max_recursive_depth {
-                break;
-            }
+            // the vertex: its position, how it scatters light and the surface it is on
+            let (p, se, hit) = match scattered {
+                Some((p, phase)) => {
+                    if bounces >= self.max_recursive_depth {
+                        break;
+                    }
+                    (p, ScatteringEvent::in_medium(phase, wo), None)
+                }
+                None => {
+                    let Some(hit) = hit else {
+                        let le = scene.le(&r);
+                        if !is_black(le) {
+                            let weight = match scatter {
+                                Some((p, pdf)) => mis_factor(pdf, scene.sky_density(p, r.dir)),
+                                None => 1.0,
+                            };
+                            l += throughput * le * weight;
+                        }
+                        break;
+                    };
 
-            let se = scene.scattering_event(&hit, wo, min_alpha);
-            if se.is_empty() {
-                break;
-            }
+                    // emission of the surface the path landed on
+                    let le = scene.emission(&hit, wo);
+                    if !is_black(le) {
+                        let weight = match scatter {
+                            Some((p, pdf)) => mis_factor(pdf, scene.area_light_density(&hit, p, r.dir)),
+                            None => 1.0,
+                        };
+                        l += throughput * le * weight;
+                    }
+
+                    // This introduces bias. 'max_recursive_depth' could be set large to reduce it.
+                    if bounces >= self.max_recursive_depth {
+                        break;
+                    }
+
+                    let se = scene.scattering_event(&hit, wo, min_alpha);
+                    if se.is_empty() {
+                        break;
+                    }
+                    (hit.p, se, Some(hit))
+                }
+            };
 
             // evaluate the lights
-            l += throughput * evaluate_direct(&se, &hit, wo, scatter, scene, rng);
+            l += throughput * evaluate_direct(&se, p, hit.as_ref(), wo, scatter, scene, rng);
 
             // the sun bounced once, which a path of one more vertex would find by itself
             if let Some(sun) = &sun_point {
                 if bounces + 1 < self.max_recursive_depth {
-                    l += throughput
-                        * connect_sun_point(&se, &hit, wo, sun, scene, min_alpha, self.filter_glossy);
+                    l += throughput * connect_sun_point(&se, p, wo, sun, scene, min_alpha, self.filter_glossy);
                 }
             }
 
@@ -382,10 +442,18 @@ impl PathTracing {
             // Going straight through thin glass does not change what the path is looking at:
             // the vertex before it stays the reference for weighting what is found next.
             if !sample.delta {
-                scatter = Some((hit.p, sample.pdf));
+                scatter = Some((p, sample.pdf));
                 min_alpha = min_alpha.max(lobe_width(self.filter_glossy, sample.pdf));
             }
-            r = Ray::new(hit.p, sample.wi, RAY_EPSILON, f32::MAX);
+            r = Ray::new(p, sample.wi, RAY_EPSILON, f32::MAX);
+
+            // crossing the surface of a solid gets the path into it or out of it
+            if let Some(hit) = &hit {
+                let into = sample.wi.dot(hit.ng) < 0.0;
+                if into != (wo.dot(hit.ng) < 0.0) && scene.materials[hit.material as usize].has_interior() {
+                    inside = into.then_some(hit.material);
+                }
+            }
 
             // Russian roulette
             if bounces > 3 && throughput.max_element() < 0.1 {
@@ -454,6 +522,6 @@ impl AmbientOcclusion {
         let wi = s * local.x + n * local.y + t * local.z;
 
         // the cosine and the pdf of the cosine weighted sample cancel out
-        attenuation * scene.transmittance(&Ray::new(hit.p, wi, RAY_EPSILON, self.max_distance))
+        attenuation * scene.surface_transmittance(&Ray::new(hit.p, wi, RAY_EPSILON, self.max_distance))
     }
 }

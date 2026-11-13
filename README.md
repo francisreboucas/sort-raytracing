@@ -34,17 +34,22 @@ cargo run --release -- --demo -o demo.png                 # the built-in interio
 cargo run --release -- house.glb -o house.png -w 1920 --spp 512 --depth 8
 cargo run --release -- house.glb --env sky.hdr --env-rotate 90      # lit by an HDR environment
 cargo run --release -- house.glb --sun 135,40 --sky 1.2,1.6,2.2     # a sun (azimuth, elevation) and a plain sky
+cargo run --release -- house.glb --eye 14,1.7,26 --target 0,4.5,0     # place the camera, in meters
 cargo run --release -- house.glb -o house.exr             # linear radiance
 cargo run --release -- house.glb --projection ortho --ortho-height 8   # orthographic view 8 m high
 cargo run --release -- house.glb --projection panorama -w 4096         # 360 degree panorama, 4096x2048
 cargo run --release -- house.glb --integrator ao --ao-distance 2       # white clay render, ambient occlusion
+cargo run --release -- house.glb --fog 0.06 --fog-anisotropy 0.6       # dust in the air of a room
+cargo run --release -- house.glb --fog 0.008 --fog-height 30           # a layer of haze over a site
 cargo run --release -- --help
 ```
 
 Scenes are glTF 2.0 (`.gltf` or `.glb`): meshes, metallic-roughness materials with their
 textures, alpha modes (mask and blend), `KHR_texture_transform`, clearcoat
 (`KHR_materials_clearcoat`) and sheen (`KHR_materials_sheen`), cameras and the lights of
-`KHR_lights_punctual`. Lengths are in meters and Y is up. A file that lists clearcoat or sheen
+`KHR_lights_punctual`. Materials of the older specular-glossiness workflow
+(`KHR_materials_pbrSpecularGlossiness`) are converted approximately. Lengths are in meters
+and Y is up. Environment maps wider than 8192 pixels are averaged down when loaded. A file that lists clearcoat or sheen
 in `extensionsRequired` (not only in `extensionsUsed`) is refused by the `gltf` crate, which
 only accepts the required extensions it has types for.
 `.png` and `.jpg` images are tone mapped (ACES by default) and sRGB encoded; `.exr` and `.hdr`
@@ -146,6 +151,7 @@ measurement are in `examples/`: `compare` (error against a reference image) and 
 | `bsdf/coat` | `bsdf.rs`, `material.rs` | A varnish or lacquer layer; the base under it is the Disney BRDF. `Material::coat`, glTF clearcoat |
 | `bsdf/fabric`, `distributionbrdf` | `bsdf.rs`, `material.rs` | The DreamWorks fabric and the distribution-based cloth of The Order: 1886, as `Material::cloth`; the second is also the glTF sheen |
 | `bsdf/doublesided` | `scene.rs`, `material.rs` | A back material, `Material::back_material`, shades the back face |
+| `medium/absorption`, `homogeneous`, `phasefunction` | `medium.rs`, `integrator.rs` | Fog and haze in a box or a layer (`--fog`), and the inside of solid glass or water (`Material::medium`, glTF `KHR_materials_volume` attenuation); Henyey-Greenstein phase function |
 | `scatteringevent` | `bsdf.rs` | A mix of BXDFs with evaluation and sampling weights |
 | `light/distant`, `pointlight`, `spot`, `skylight`, `hdrskylight`, `area` | `light.rs` | An area light is a set of emissive triangles |
 | `material` and the Tiny Shading Language | `material.rs` | No shading language: a fixed set of parameters becomes the closures |
@@ -172,9 +178,17 @@ measurement are in `examples/`: `compare` (error against a reference image) and 
   transmittance of a straight trip down and up, not the curve SORT's Blender node uses. The
   fabric is normalized with the exact albedo of its lobe; SORT's table makes it 7 to 21% darker.
 
+- **Participating media.** SORT attaches a medium to any mesh and keeps a stack of the media a
+  ray is in. Here a medium is either fog filling a box (the bounds of the scene, or a layer
+  below a height that goes on forever sideways) or the inside of a solid transmissive object.
+  A box needs no boundary mesh and works wherever the camera is. Absorption is not sampled,
+  it is a plain factor; the vertices of a path inside a medium are lit like the ones on
+  surfaces, with the same light sampling.
+
 ## Not ported yet
 
-Participating media, sub-surface scattering, hair and fur, the MERL and Fourier BRDFs, the
+The heterogeneous medium (it needs volume data), media bound to arbitrary meshes, emission
+inside a medium, sub-surface scattering, hair and fur, the MERL and Fourier BRDFs, the
 other integrators (bidirectional, light tracing, instant radiosity, Whitted), the other
 accelerators (QBVH, OBVH, k-d tree, octree, uniform grid) and SIMD. A coat over anything but
 the Disney BRDF. On the glTF side: texture coordinate sets other than `TEXCOORD_0`, the normal
@@ -183,9 +197,9 @@ expose it there, so a transformed normal map is applied with the mesh UVs as the
 
 ## Tests
 
-`cargo test` runs 41 tests: importance sampling against value and pdf for every BXDF, the BVH
+`cargo test` runs 48 tests: importance sampling against value and pdf for every BXDF, the BVH
 against a brute force loop, the camera, the environment map, the glTF loader, materials and
-their textures, and renders compared with analytic results.
+their textures, participating media, and renders compared with analytic results.
 
 ## Models
 

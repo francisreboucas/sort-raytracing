@@ -12,6 +12,7 @@ use crate::bsdf::{
     Bxdf, Coat, Disney, DistributionBrdf, Fabric, Fresnel, Ggx, MicrofacetReflection, ScatteringEvent,
 };
 use crate::math::*;
+use crate::medium::Medium;
 use glam::{Affine2, Mat2};
 use std::sync::{Arc, OnceLock};
 
@@ -38,7 +39,7 @@ fn srgb_lut() -> &'static [f32; 256] {
 
 impl Texture {
     #[inline]
-    fn texel(&self, x: usize, y: usize) -> Vec4 {
+    pub fn texel(&self, x: usize, y: usize) -> Vec4 {
         let p = self.data[y * self.width + x];
         if self.srgb {
             let lut = srgb_lut();
@@ -160,6 +161,11 @@ pub struct Material {
     /// Light goes straight through it and shadow rays are attenuated instead of blocked.
     pub thin: bool,
     pub ior: f32,
+    /// What fills the inside of a solid transmissive object (not `thin`): thick tinted glass,
+    /// the water of a pool. Light that crosses it is absorbed and scattered along the way, so
+    /// thick parts are darker than thin ones (glTF `KHR_materials_volume`). The faces must
+    /// point outwards. A camera placed inside the object does not see the medium.
+    pub medium: Option<Medium>,
     pub specular: f32,
     pub specular_tint: f32,
     pub anisotropic: f32,
@@ -237,6 +243,7 @@ impl Default for Material {
             transmission: 0.0,
             thin: false,
             ior: 1.5,
+            medium: None,
             specular: 1.0,
             specular_tint: 0.0,
             anisotropic: 0.0,

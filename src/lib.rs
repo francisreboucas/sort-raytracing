@@ -14,6 +14,7 @@ pub mod gltf_loader;
 pub mod integrator;
 pub mod light;
 pub mod material;
+pub mod medium;
 pub mod math;
 pub mod render;
 pub mod rng;

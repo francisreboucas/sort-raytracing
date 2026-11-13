@@ -7,6 +7,7 @@
 //! its value already includes the cosine term of the incident direction.
 
 use crate::math::*;
+use crate::medium::HenyeyGreenstein;
 use crate::rng::Rng;
 
 // ---------------------------------------------------------------------------------------------
@@ -1013,6 +1014,9 @@ pub enum Bxdf {
     Coat(Coat),
     Fabric(Fabric),
     DistributionBrdf(DistributionBrdf),
+    /// The phase function of a participating medium, for a path vertex inside it. There is
+    /// no surface: it has no cosine and scatters over the whole sphere.
+    Phase(HenyeyGreenstein),
 }
 
 impl Bxdf {
@@ -1032,6 +1036,7 @@ impl Bxdf {
             Bxdf::Coat(c) => c.f(wo, wi),
             Bxdf::Fabric(c) => c.f(wo, wi),
             Bxdf::DistributionBrdf(c) => c.f(wo, wi),
+            Bxdf::Phase(p) => Spectrum::splat(p.f(wo.dot(wi))),
         }
     }
 
@@ -1046,6 +1051,7 @@ impl Bxdf {
             Bxdf::Coat(c) => c.pdf(wo, wi),
             Bxdf::Fabric(c) => c.pdf(wo, wi),
             Bxdf::DistributionBrdf(c) => c.pdf(wo, wi),
+            Bxdf::Phase(p) => p.f(wo.dot(wi)),
         }
     }
 
@@ -1069,6 +1075,11 @@ impl Bxdf {
             Bxdf::Coat(c) => c.sample(wo, bs, rng),
             Bxdf::Fabric(c) => c.sample(wo, bs, rng),
             Bxdf::DistributionBrdf(c) => c.sample(wo, bs),
+            Bxdf::Phase(p) => {
+                let wi = p.sample(wo, bs);
+                let f = p.f(wo.dot(wi));
+                (f > 0.0).then(|| (Spectrum::splat(f), wi, f))
+            }
         }
     }
 }
@@ -1140,7 +1151,10 @@ impl ScatteringEvent {
             | Bxdf::Coat(_)
             | Bxdf::Fabric(_)
             | Bxdf::DistributionBrdf(_) => false,
-            Bxdf::LambertTransmission(_) | Bxdf::MicrofacetRefraction(_) | Bxdf::Transparent(_) => true,
+            Bxdf::LambertTransmission(_)
+            | Bxdf::MicrofacetRefraction(_)
+            | Bxdf::Transparent(_)
+            | Bxdf::Phase(_) => true,
             Bxdf::Disney(d) => d.spec_trans > 0.0 || (d.thin_surface && d.diff_trans > 0.0),
         };
         self.units[self.count] = ScatteringUnit { bxdf, eval_weight, sample_weight };
@@ -1151,6 +1165,13 @@ impl ScatteringEvent {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.count == 0
+    }
+
+    /// The scattering event of a path vertex inside a participating medium, seen from `wo`.
+    pub fn in_medium(phase: HenyeyGreenstein, wo: Vec3) -> Self {
+        let mut se = Self::new(wo, coordinate_system(wo).0);
+        se.add_bxdf(Bxdf::Phase(phase), Spectrum::ONE, 1.0);
+        se
     }
 
     #[inline]
