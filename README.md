@@ -1,4 +1,4 @@
-# SORT-rs
+# SORT-RayTracing
 
 [![License: GPL-3.0-only](https://img.shields.io/badge/license-GPL--3.0--only-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-pure_Rust-orange.svg?logo=rust)](https://www.rust-lang.org/)
@@ -140,7 +140,7 @@ measurement are in `examples/`: `compare` (error against a reference image) and 
 
 ## What is ported
 
-| SORT (C++) | SORT-rs | Notes |
+| SORT (C++) | SORT-RayTracing | Notes |
 |---|---|---|
 | `integrator/pathtracing`, `integratormethod` | `integrator.rs` | Path tracing, light sampling with multiple importance sampling, Russian roulette; see above |
 | `integrator/ao` | `integrator.rs` | Ambient occlusion for white "clay" renders; thin glass attenuates instead of blocking |
@@ -203,7 +203,7 @@ their textures, participating media, and renders compared with analytic results.
 
 ## Models
 
-The models in the images are in [`assets/models`](assets/models). They are not part of SORT-rs
+The models in the images are in [`assets/models`](assets/models). They are not part of SORT-RayTracing
 and keep their own licenses:
 
 | Model | Author | License | File |
@@ -214,6 +214,6 @@ and keep their own licenses:
 
 ## License
 
-SORT-rs is a derived work of SORT, which is Copyright (c) 2011-2023 Jiayin Cao and distributed
-under the GNU General Public License version 3. SORT-rs is distributed under the same license,
+SORT-RayTracing is a derived work of SORT, which is Copyright (c) 2011-2023 Jiayin Cao and distributed
+under the GNU General Public License version 3. SORT-RayTracing is distributed under the same license,
 [GPL-3.0-only](LICENSE).
