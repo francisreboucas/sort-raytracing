@@ -86,6 +86,26 @@ save_image(Path::new("room.png"), &pixels, camera.width, camera.height, 1.0, Ton
 
 `cargo run --release --example library` renders this image.
 
+An application that shows the image while it renders uses `Progressive` instead of `render`
+([`examples/progressive.rs`](examples/progressive.rs)). Each step adds one sample to every
+pixel, the image so far can be read between two steps, and dropping it abandons the render:
+
+```rust
+let mut render = Progressive::new(&scene, &camera, &settings);
+while render.step() {
+    show(&render.image(), render.samples(), render.total_samples());
+    if camera_moved() { break; }
+}
+```
+
+`Progressive::with_region` renders a rectangle of the image only, in pixels from the top left
+corner, and never traces the rest:
+
+```rust
+let region = Region { x: 220, y: 120, width: 200, height: 120 };
+let mut render = Progressive::with_region(&scene, &camera, &settings, region);
+```
+
 [`examples/materials.rs`](examples/materials.rs) shows the coat, the sheen and the two cloths
 (`Material::coat`, `sheen_color`, `cloth`) on a row of spheres over a varnished floor:
 `cargo run --release --example materials`. A material can also have a different material on
