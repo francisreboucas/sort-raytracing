@@ -4,7 +4,7 @@ use sort_raytracing::camera::{Camera, Projection};
 use sort_raytracing::light::{EnvMap, Light, Sky};
 use sort_raytracing::math::*;
 use sort_raytracing::medium::{Fog, Medium};
-use sort_raytracing::render::{render, save_image, Integrator, RenderSettings, ToneMap};
+use sort_raytracing::render::{render, save_image, Integrator, Progressive, Region, RenderSettings, ToneMap};
 use sort_raytracing::{demo, gltf_loader};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -27,6 +27,8 @@ OPTIONS:
         --integrator <i>      pt (path tracing) or ao (ambient occlusion: a white \"clay\" render
                               without materials or lights) [pt]
         --ao-distance <m>     Distance within which geometry darkens a point (ao) [3]
+        --region <x,y,w,h>    Render this rectangle of the image only, in pixels from the top
+                              left corner; the rest of the image is left black
         --camera <index>      Which camera of the file to use [0]
         --projection <p>      perspective, ortho or panorama (360 degrees, latitude-longitude)
                               [the projection of the camera]
@@ -73,6 +75,7 @@ struct Args {
     output: PathBuf,
     width: u32,
     height: Option<u32>,
+    region: Option<Region>,
     camera: usize,
     projection: Option<ProjectionArg>,
     ortho_height: Option<f32>,
@@ -115,6 +118,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         output: PathBuf::from("render.png"),
         width: 1280,
         height: None,
+        region: None,
         camera: 0,
         projection: None,
         ortho_height: None,
@@ -155,6 +159,14 @@ fn parse_args() -> Result<Option<Args>, String> {
             "-h" | "--height" => args.height = Some(num(&arg, value()?)?),
             "-s" | "--spp" => args.settings.samples_per_pixel = num(&arg, value()?)?,
             "-d" | "--depth" => args.settings.max_depth = num(&arg, value()?)?,
+            "--region" => {
+                let value = value()?;
+                let list: Result<Vec<u32>, _> = value.split(',').map(|v| v.trim().parse::<u32>()).collect();
+                args.region = Some(match list.as_deref() {
+                    Ok(&[x, y, width, height]) => Region { x, y, width, height },
+                    _ => return Err(format!("expected 4 comma separated whole numbers, got '{value}'")),
+                });
+            }
             "--camera" => args.camera = num(&arg, value()?)?,
             "--projection" => {
                 args.projection = Some(match value()?.as_str() {
@@ -225,6 +237,9 @@ fn parse_args() -> Result<Option<Args>, String> {
     }
     if args.width == 0 || args.height == Some(0) {
         return Err("the image size must not be zero".into());
+    }
+    if args.region.is_some_and(|r| r.width == 0 || r.height == 0) {
+        return Err("the region size must not be zero".into());
     }
     if args.ortho_height.is_some_and(|h| !(h > 0.0)) {
         return Err("the orthographic height must be positive".into());
@@ -424,14 +439,42 @@ fn run(args: Args) -> Result<(), String> {
             camera.width, camera.height, args.settings.samples_per_pixel
         ),
     }
-    let start = Instant::now();
-    let last_percent = AtomicU32::new(0);
-    let pixels = render(&scene, &camera, &args.settings, |fraction| {
-        let percent = (fraction * 100.0) as u32;
-        if last_percent.fetch_max(percent, Ordering::Relaxed) < percent && percent % 5 == 0 {
-            eprintln!("  {percent:3}%  ({:.1?})", start.elapsed());
+    let region = match args.region {
+        Some(region) if region.x >= camera.width || region.y >= camera.height => {
+            return Err(format!(
+                "the region starts at {},{}, outside of the {}x{} image",
+                region.x, region.y, camera.width, camera.height
+            ));
         }
-    });
+        region => region,
+    };
+    let start = Instant::now();
+    let pixels = match region {
+        Some(region) => {
+            let mut render = Progressive::with_region(&scene, &camera, &args.settings, region);
+            let region = render.region();
+            eprintln!("region of {}x{} at {},{}", region.width, region.height, region.x, region.y);
+            // one sample per pixel at a time: the progress is the samples done
+            let mut last_percent = 0;
+            while render.step() {
+                let percent = render.samples() * 100 / render.total_samples();
+                if percent / 5 > last_percent / 5 {
+                    eprintln!("  {:3}%  ({:.1?})", percent / 5 * 5, start.elapsed());
+                }
+                last_percent = percent;
+            }
+            render.image()
+        }
+        None => {
+            let last_percent = AtomicU32::new(0);
+            render(&scene, &camera, &args.settings, |fraction| {
+                let percent = (fraction * 100.0) as u32;
+                if last_percent.fetch_max(percent, Ordering::Relaxed) < percent && percent % 5 == 0 {
+                    eprintln!("  {percent:3}%  ({:.1?})", start.elapsed());
+                }
+            })
+        }
+    };
     eprintln!("rendered in {:.2?}", start.elapsed());
 
     // ambient occlusion is display-referred already, ACES would grey its white

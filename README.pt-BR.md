@@ -41,6 +41,7 @@ cargo run --release -- casa.glb --projection panorama -w 4096          # panoram
 cargo run --release -- casa.glb --integrator ao --ao-distance 2        # render branco de maquete, ambient occlusion
 cargo run --release -- casa.glb --fog 0.06 --fog-anisotropy 0.6        # poeira no ar de uma sala
 cargo run --release -- casa.glb --fog 0.008 --fog-height 30            # uma camada de névoa sobre um terreno
+cargo run --release -- casa.glb --region 400,200,480,270             # só um retângulo da imagem
 cargo run --release -- --help
 ```
 

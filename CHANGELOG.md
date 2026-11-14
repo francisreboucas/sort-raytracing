@@ -6,6 +6,11 @@ listed newest first.
 
 ## [Unreleased]
 
+### Added
+
+- CLI: `--region <x,y,w,h>` renders a rectangle of the image only, in pixels from the top left
+  corner. The rest of the image is left black.
+
 ## [0.1.1] - 2026-11-14
 
 ### Added
