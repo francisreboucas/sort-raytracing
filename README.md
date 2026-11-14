@@ -41,6 +41,7 @@ cargo run --release -- house.glb --projection panorama -w 4096         # 360 deg
 cargo run --release -- house.glb --integrator ao --ao-distance 2       # white clay render, ambient occlusion
 cargo run --release -- house.glb --fog 0.06 --fog-anisotropy 0.6       # dust in the air of a room
 cargo run --release -- house.glb --fog 0.008 --fog-height 30           # a layer of haze over a site
+cargo run --release -- house.glb --region 400,200,480,270            # a rectangle of the image only
 cargo run --release -- --help
 ```
 
