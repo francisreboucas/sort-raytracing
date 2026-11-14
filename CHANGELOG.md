@@ -6,6 +6,17 @@ listed newest first.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-14
+
+### Added
+
+- `render::Progressive`: a render refined one sample per pixel at a time, for an application
+  that shows the image while it converges. `step` and `step_by` add samples, `image` and
+  `region_pixels` read the image so far, and dropping it abandons the render.
+- `render::Region` and `Progressive::with_region`: render a rectangle of the image only; the
+  rest is never traced.
+- `examples/progressive.rs`.
+
 ## [0.1.0] - 2026-11-13
 
 The first release.
@@ -62,5 +73,6 @@ The first release.
   glTF cameras have no focal distance. The height now comes from the distance to the center of
   the scene.
 
-[Unreleased]: https://github.com/francisreboucas/sort-raytracing/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/francisreboucas/sort-raytracing/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/francisreboucas/sort-raytracing/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/francisreboucas/sort-raytracing/releases/tag/v0.1.0
