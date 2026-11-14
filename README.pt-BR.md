@@ -87,6 +87,27 @@ save_image(Path::new("room.png"), &pixels, camera.width, camera.height, 1.0, Ton
 
 `cargo run --release --example library` gera esta imagem.
 
+Uma aplicação que mostra a imagem enquanto ela é renderizada usa `Progressive` no lugar de
+`render` ([`examples/progressive.rs`](examples/progressive.rs)). Cada passo soma uma amostra a
+todos os pixels, a imagem parcial pode ser lida entre dois passos, e descartar o objeto
+abandona o render:
+
+```rust
+let mut render = Progressive::new(&scene, &camera, &settings);
+while render.step() {
+    show(&render.image(), render.samples(), render.total_samples());
+    if camera_moved() { break; }
+}
+```
+
+`Progressive::with_region` renderiza só um retângulo da imagem, em pixels a partir do canto
+superior esquerdo, e nunca traça o resto:
+
+```rust
+let region = Region { x: 220, y: 120, width: 200, height: 120 };
+let mut render = Progressive::with_region(&scene, &camera, &settings, region);
+```
+
 [`examples/materials.rs`](examples/materials.rs) mostra o coat, o sheen e os dois tecidos
 (`Material::coat`, `sheen_color`, `cloth`) em uma fileira de esferas sobre um piso envernizado:
 `cargo run --release --example materials`. Um material também pode ter outro material na face

@@ -73,7 +73,25 @@ pub fn render(
     progress: impl Fn(f32) + Sync,
 ) -> Vec<Spectrum> {
     let (width, height) = (camera.width as usize, camera.height as usize);
-    let integrator = match settings.integrator {
+    let integrator = active_integrator(settings);
+    let spp = settings.samples_per_pixel.max(1);
+    let done = AtomicUsize::new(0);
+
+    let mut pixels = vec![Spectrum::ZERO; width * height];
+    pixels.par_chunks_mut(width).enumerate().for_each(|(y, row)| {
+        let mut rng = Rng::new(settings.seed, y as u64);
+        add_samples(&integrator, scene, camera, settings, &mut rng, 0, y, row, spp);
+        for pixel in row.iter_mut() {
+            *pixel /= spp as f32;
+        }
+        let finished = done.fetch_add(1, Ordering::Relaxed) + 1;
+        progress(finished as f32 / height as f32);
+    });
+    pixels
+}
+
+fn active_integrator(settings: &RenderSettings) -> Active {
+    match settings.integrator {
         Integrator::PathTracing => Active::PathTracing(PathTracing {
             max_recursive_depth: settings.max_depth,
             filter_glossy: settings.filter_glossy,
@@ -81,36 +99,184 @@ pub fn render(
         Integrator::AmbientOcclusion { max_distance } => {
             Active::AmbientOcclusion(AmbientOcclusion { max_distance })
         }
-    };
-    let spp = settings.samples_per_pixel.max(1);
-    let done = AtomicUsize::new(0);
+    }
+}
 
-    let mut pixels = vec![Spectrum::ZERO; width * height];
-    pixels.par_chunks_mut(width).enumerate().for_each(|(y, row)| {
-        let mut rng = Rng::new(settings.seed, y as u64);
-        for (x, pixel) in row.iter_mut().enumerate() {
-            let mut sum = Spectrum::ZERO;
-            for _ in 0..spp {
-                let (jx, jy) = rng.pair();
-                let ray = camera.generate_ray(x as f32 + jx, y as f32 + jy, rng.pair());
-                let mut radiance = integrator.li(&ray, scene, &mut rng);
-                if !radiance.is_finite() {
-                    continue;
-                }
-                if let Some(limit) = settings.clamp {
-                    let max = radiance.max_element();
-                    if max > limit {
-                        radiance *= limit / max;
-                    }
-                }
-                sum += radiance;
+/// Add `count` samples to the sum of each pixel of a piece of row `y` that starts at pixel `x0`.
+#[allow(clippy::too_many_arguments)]
+fn add_samples(
+    integrator: &Active,
+    scene: &Scene,
+    camera: &Camera,
+    settings: &RenderSettings,
+    rng: &mut Rng,
+    x0: usize,
+    y: usize,
+    sums: &mut [Spectrum],
+    count: u32,
+) {
+    for (i, sum) in sums.iter_mut().enumerate() {
+        let x = x0 + i;
+        for _ in 0..count {
+            let (jx, jy) = rng.pair();
+            let ray = camera.generate_ray(x as f32 + jx, y as f32 + jy, rng.pair());
+            let mut radiance = integrator.li(&ray, scene, rng);
+            if !radiance.is_finite() {
+                continue;
             }
-            *pixel = sum / spp as f32;
+            if let Some(limit) = settings.clamp {
+                let max = radiance.max_element();
+                if max > limit {
+                    radiance *= limit / max;
+                }
+            }
+            *sum += radiance;
         }
-        let finished = done.fetch_add(1, Ordering::Relaxed) + 1;
-        progress(finished as f32 / height as f32);
-    });
-    pixels
+    }
+}
+
+/// A rectangle of the image, in pixels from its top left corner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Region {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// A render that is refined a few samples at a time, of the whole image or of a region of it,
+/// for an application that shows the image while it converges.
+///
+/// Each call to [`step`](Self::step) adds one sample to every pixel; the image so far can be
+/// read between two calls, and the render is abandoned by dropping it. `samples_per_pixel` of
+/// the settings is where it ends.
+///
+/// ```no_run
+/// # use sort_raytracing::{demo, render::{Progressive, RenderSettings}};
+/// let (builder, camera) = demo::interior(640, 360);
+/// let scene = builder.build();
+/// let mut render = Progressive::new(&scene, &camera, &RenderSettings::default());
+/// while render.step() {
+///     let pixels = render.image();
+///     // show them, and `break` when the user moves the camera or closes the view
+/// }
+/// ```
+pub struct Progressive<'a> {
+    scene: &'a Scene,
+    camera: &'a Camera,
+    settings: RenderSettings,
+    integrator: Active,
+    region: Region,
+    /// Sum of the samples of each pixel of the region, row by row.
+    sums: Vec<Spectrum>,
+    /// One generator per row of the region, kept from one step to the next.
+    rngs: Vec<Rng>,
+    samples: u32,
+}
+
+impl<'a> Progressive<'a> {
+    /// A render of the whole image.
+    pub fn new(scene: &'a Scene, camera: &'a Camera, settings: &RenderSettings) -> Self {
+        let region = Region { x: 0, y: 0, width: camera.width, height: camera.height };
+        Self::with_region(scene, camera, settings, region)
+    }
+
+    /// A render of a region of the image only, which is cut to fit the image. The rest of the
+    /// image is never traced.
+    pub fn with_region(scene: &'a Scene, camera: &'a Camera, settings: &RenderSettings, region: Region) -> Self {
+        let (x, y) = (region.x.min(camera.width), region.y.min(camera.height));
+        let region = Region {
+            x,
+            y,
+            width: region.width.min(camera.width - x),
+            height: region.height.min(camera.height - y),
+        };
+        Self {
+            scene,
+            camera,
+            settings: settings.clone(),
+            integrator: active_integrator(settings),
+            region,
+            sums: vec![Spectrum::ZERO; region.width as usize * region.height as usize],
+            // seeded by the row of the image, as `render` does
+            rngs: (0..region.height).map(|row| Rng::new(settings.seed, (y + row) as u64)).collect(),
+            samples: 0,
+        }
+    }
+
+    /// The region being rendered: the whole image unless one was given.
+    pub fn region(&self) -> Region {
+        self.region
+    }
+
+    /// Samples per pixel rendered so far.
+    pub fn samples(&self) -> u32 {
+        self.samples
+    }
+
+    /// Samples per pixel of the finished render.
+    pub fn total_samples(&self) -> u32 {
+        self.settings.samples_per_pixel.max(1)
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.samples >= self.total_samples()
+    }
+
+    /// Add one sample to every pixel. Returns false, without rendering, once the render is done.
+    pub fn step(&mut self) -> bool {
+        self.step_by(1) == 1
+    }
+
+    /// Add up to `count` samples to every pixel, on all the threads, and return how many were
+    /// added: less than `count` at the end of the render. More samples per step waste less
+    /// time between steps, fewer give the application the image more often.
+    pub fn step_by(&mut self, count: u32) -> u32 {
+        let count = count.min(self.total_samples() - self.samples.min(self.total_samples()));
+        if count == 0 {
+            return 0;
+        }
+        if !self.sums.is_empty() {
+            let (scene, camera, settings, integrator) = (self.scene, self.camera, &self.settings, &self.integrator);
+            let (x0, y0) = (self.region.x as usize, self.region.y as usize);
+            self.sums
+                .par_chunks_mut(self.region.width as usize)
+                .zip(self.rngs.par_iter_mut())
+                .enumerate()
+                .for_each(|(row, (sums, rng))| {
+                    add_samples(integrator, scene, camera, settings, rng, x0, y0 + row, sums, count);
+                });
+        }
+        self.samples += count;
+        count
+    }
+
+    /// The pixels of the region so far: linear radiance, row by row from the top of the
+    /// region. Black before the first step.
+    pub fn region_pixels(&self) -> Vec<Spectrum> {
+        let scale = 1.0 / self.samples.max(1) as f32;
+        self.sums.iter().map(|sum| *sum * scale).collect()
+    }
+
+    /// The whole image so far, as `render` returns it, black outside of the region.
+    pub fn image(&self) -> Vec<Spectrum> {
+        let region = self.region;
+        if region.width == self.camera.width && region.height == self.camera.height {
+            return self.region_pixels();
+        }
+        let width = self.camera.width as usize;
+        let scale = 1.0 / self.samples.max(1) as f32;
+        let mut image = vec![Spectrum::ZERO; width * self.camera.height as usize];
+        if !self.sums.is_empty() {
+            for (row, sums) in self.sums.chunks(region.width as usize).enumerate() {
+                let start = (region.y as usize + row) * width + region.x as usize;
+                for (pixel, sum) in image[start..start + sums.len()].iter_mut().zip(sums) {
+                    *pixel = *sum * scale;
+                }
+            }
+        }
+        image
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,6 +355,70 @@ mod tests {
         let camera = Camera::look_at(Vec3::new(0.0, 3.0, 0.0), Vec3::ZERO, Vec3::Z, 0.01, 3, 3);
         let settings = RenderSettings { samples_per_pixel: spp, max_depth: depth, ..Default::default() };
         render(scene, &camera, &settings, |_| {})[4]
+    }
+
+    fn furnace(albedo: Spectrum) -> Scene {
+        let mut builder = SceneBuilder::new();
+        let material = builder.add_material(Material { base_color: albedo, specular: 0.0, roughness: 1.0, ..Default::default() });
+        floor(&mut builder, material);
+        builder.add_light(Light::Sky(Sky { intensity: Spectrum::ONE, env: None, rotation: 0.0 }));
+        builder.build()
+    }
+
+    /// All the samples in one step are the samples of `render`, in the same order: the image
+    /// is the same bit for bit, and so are the rows of a region as wide as the image.
+    #[test]
+    fn progressive_in_one_step_is_render() {
+        let scene = furnace(Spectrum::new(0.7, 0.5, 0.3));
+        let camera = Camera::look_at(Vec3::new(0.0, 3.0, 0.0), Vec3::ZERO, Vec3::Z, 0.8, 8, 6);
+        let settings = RenderSettings { samples_per_pixel: 16, ..Default::default() };
+        let reference = render(&scene, &camera, &settings, |_| {});
+
+        let mut whole = Progressive::new(&scene, &camera, &settings);
+        assert_eq!(whole.image(), vec![Spectrum::ZERO; 48]);
+        assert_eq!(whole.step_by(100), 16);
+        assert!(whole.is_done());
+        assert_eq!(whole.image(), reference);
+
+        let mut rows = Progressive::with_region(&scene, &camera, &settings, Region { x: 0, y: 2, width: 8, height: 3 });
+        rows.step_by(16);
+        assert_eq!(rows.region_pixels(), reference[16..40]);
+        let image = rows.image();
+        assert_eq!(image[16..40], reference[16..40]);
+        assert!(image[..16].iter().chain(&image[40..]).all(|p| *p == Spectrum::ZERO));
+    }
+
+    /// One sample at a time, a region converges to what the whole image does, and the render
+    /// ends at the samples per pixel of the settings.
+    #[test]
+    fn progressive_region_converges() {
+        let albedo = Spectrum::new(0.7, 0.5, 0.3);
+        let scene = furnace(albedo);
+        let camera = Camera::look_at(Vec3::new(0.0, 3.0, 0.0), Vec3::ZERO, Vec3::Z, 0.01, 8, 6);
+        let settings = RenderSettings { samples_per_pixel: 2000, ..Default::default() };
+
+        // cut to the image
+        let outside = Progressive::with_region(&scene, &camera, &settings, Region { x: 6, y: 4, width: 100, height: 100 });
+        assert_eq!(outside.region(), Region { x: 6, y: 4, width: 2, height: 2 });
+        let mut empty = Progressive::with_region(&scene, &camera, &settings, Region { x: 9, y: 0, width: 4, height: 4 });
+        assert!(empty.step() && empty.region_pixels().is_empty());
+
+        let mut render = Progressive::with_region(&scene, &camera, &settings, Region { x: 3, y: 1, width: 2, height: 2 });
+        let mut steps = 0;
+        while render.step() {
+            steps += 1;
+            assert_eq!(render.samples(), steps);
+        }
+        assert_eq!(steps, 2000);
+        assert!(render.is_done() && !render.step());
+        let pixels = render.region_pixels();
+        assert_eq!(pixels.len(), 4);
+        for pixel in &pixels {
+            assert!((*pixel - albedo).abs().max_element() < 0.06, "got {pixel:?}, expected {albedo:?}");
+        }
+        // the region sits at (3, 1) of the image
+        assert_eq!(render.image()[8 + 3], pixels[0]);
+        assert_eq!(render.image()[2 * 8 + 4], pixels[3]);
     }
 
     /// A diffuse plane under a uniform sky of radiance 1 reflects exactly its albedo.
