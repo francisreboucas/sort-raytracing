@@ -1,6 +1,6 @@
 [package]
 name = "sort-raytracing"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "GPL-3.0-only"
 description = "Pure Rust port of SORT (Simple Open-source Ray Tracing), focused on architectural rendering"
